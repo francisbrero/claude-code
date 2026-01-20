@@ -64,9 +64,9 @@ For reliable remote access that survives network changes:
 brew install mosh
 ```
 
-**5. Use Blink Shell on iPhone**
+**5. Use Terminus on iPhone**
 - Supports Mosh protocol
-- Generate SSH key in secure enclave
+- Generate SSH key in app settings
 - Connect via: `mosh user@mac-tailscale-name`
 
 **6. Attach to Claude session**
@@ -306,7 +306,7 @@ For personal use from phone:
 
 1. **Tailscale** - Zero-config VPN between devices
 2. **Mosh** - Resilient mobile connections
-3. **Blink Shell** - Best iOS SSH/Mosh client
+3. **Terminus** - iOS SSH/Mosh client
 4. **tmux** - Session persistence
 5. **Simple shell functions** - See `scripts/claude-remote.zsh` (no external deps)
 
@@ -339,7 +339,7 @@ For bot/automation:
 - Multiple people accessing the same Claude instance
 
 **Skip Clawdbot if:**
-- You have a good SSH client on your phone (Blink Shell)
+- You have a good SSH client on your phone (Terminus)
 - You're the only user
 - You prefer minimal dependencies
 

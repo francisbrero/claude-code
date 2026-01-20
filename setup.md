@@ -524,7 +524,7 @@
   - Mac with Claude Code installed
   - tmux (`brew install tmux`)
   - SSH enabled (System Settings > General > Sharing > Remote Login)
-  - Mobile SSH client (Blink Shell recommended for iOS)
+  - Mobile SSH client (Terminus recommended for iOS)
 
   ### Quick Setup (Tailscale + Mosh)
 
@@ -545,7 +545,7 @@
   - System Settings > General > Sharing > Remote Login: On
   - Add your SSH key to `~/.ssh/authorized_keys`
 
-  **4. Connect from phone (Blink Shell)**
+  **4. Connect from phone (Terminus)**
   ```bash
   # Mosh survives network changes
   mosh user@your-mac-tailscale-name
