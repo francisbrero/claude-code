@@ -308,13 +308,42 @@ For personal use from phone:
 2. **Mosh** - Resilient mobile connections
 3. **Blink Shell** - Best iOS SSH/Mosh client
 4. **tmux** - Session persistence
-5. **claunch or cld** - Session management
+5. **Simple shell functions** - See `scripts/claude-remote.zsh` (no external deps)
 
 For bot/automation:
 
-1. **Headless mode** (`-p` flag) for simple tasks
-2. **Clawdbot** for multi-channel personal assistant
+1. **Headless mode** (`-p` flag) for simple tasks - See `scripts/claude-headless.zsh`
+2. **Clawdbot** for multi-channel personal assistant (see evaluation below)
 3. **claude-code-slack-bot** for team Slack integration
+
+---
+
+## Clawdbot Evaluation
+
+**What it is:** Self-hosted AI gateway that routes messages from multiple channels (WhatsApp, Telegram, Slack, etc.) to Claude.
+
+**Pros:**
+- Multi-channel access from a single bot
+- Works with Claude Pro/Max subscription
+- Tailscale integration for secure remote access
+- Voice support, canvas, tool execution
+
+**Cons:**
+- Adds complexity (Node.js daemon, channel configuration)
+- Requires managing tokens/credentials for each channel
+- Another moving part to maintain
+
+**Verdict:** For personal use, direct tmux + SSH/Mosh is simpler and more reliable. Clawdbot is worth considering if you need:
+- WhatsApp/Telegram access (no native SSH clients)
+- Voice interaction
+- Multiple people accessing the same Claude instance
+
+**Skip Clawdbot if:**
+- You have a good SSH client on your phone (Blink Shell)
+- You're the only user
+- You prefer minimal dependencies
+
+For most solo developers, the lightweight approach (Tailscale + Mosh + tmux + shell functions) covers all needs without additional complexity
 
 ---
 

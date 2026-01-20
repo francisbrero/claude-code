@@ -515,7 +515,150 @@
   }
   ```
 
-  9. Keyboard Shortcuts Reference
+  9. Remote Session Control
+
+  Control Claude Code sessions from your phone or other devices.
+
+  ### Prerequisites
+
+  - Mac with Claude Code installed
+  - tmux (`brew install tmux`)
+  - SSH enabled (System Settings > General > Sharing > Remote Login)
+  - Mobile SSH client (Blink Shell recommended for iOS)
+
+  ### Quick Setup (Tailscale + Mosh)
+
+  **1. Install Tailscale on both devices**
+  ```bash
+  # Mac
+  brew install tailscale
+  # Start and authenticate
+  sudo tailscale up
+  ```
+
+  **2. Install Mosh for resilient connections**
+  ```bash
+  brew install mosh
+  ```
+
+  **3. Enable SSH on Mac**
+  - System Settings > General > Sharing > Remote Login: On
+  - Add your SSH key to `~/.ssh/authorized_keys`
+
+  **4. Connect from phone (Blink Shell)**
+  ```bash
+  # Mosh survives network changes
+  mosh user@your-mac-tailscale-name
+
+  # Attach to Claude session
+  tmux attach -t claude
+  ```
+
+  ### Session Helper Functions
+
+  Add to your `.zshrc`:
+  ```bash
+  source ~/path/to/scripts/claude-remote.zsh
+  ```
+
+  **Core commands:**
+  | Command | Description |
+  |---------|-------------|
+  | `claude-session [name]` | Start/attach to named session |
+  | `claude-bg [name]` | Start session in background |
+  | `cc` | Project-based session (uses directory name) |
+  | `ccbg` | Project session in background |
+  | `cca` | Quick attach to any Claude session |
+  | `claude-ls` | List all Claude sessions |
+  | `claude-kill [name]` | Kill a session |
+
+  **Remote control (without attaching):**
+  | Command | Description |
+  |---------|-------------|
+  | `claude-send "prompt"` | Send prompt to running session |
+  | `claude-capture [lines]` | View recent session output |
+
+  **Unattended mode:**
+  | Command | Description |
+  |---------|-------------|
+  | `claude-auto [name]` | Start with --dangerously-skip-permissions |
+  | `claude-auto-bg [name]` | Background unattended session |
+
+  **Typical workflow:**
+  ```bash
+  # On your Mac - start a session and detach
+  cc                     # Start project session
+  # Press Ctrl+B, D to detach
+
+  # From phone via SSH/Mosh
+  cca                    # Quick attach
+  # Or send a prompt without attaching
+  claude-send "Run the tests and fix any failures"
+  ```
+
+  ### Headless Mode (Programmatic)
+
+  For automation and CI/CD, use the `-p` flag. Add helpers to `.zshrc`:
+  ```bash
+  source ~/path/to/scripts/claude-headless.zsh
+  ```
+
+  **Quick queries:**
+  | Command | Description |
+  |---------|-------------|
+  | `cq "question"` | Simple text query |
+  | `cqj "question"` | JSON output (with metadata) |
+  | `cqs "question"` | Streaming JSON |
+  | `cc-result "question"` | Extract just the result text |
+
+  **Session continuation:**
+  | Command | Description |
+  |---------|-------------|
+  | `cc-continue "follow up"` | Continue last conversation |
+  | `cc-resume <id> "question"` | Resume specific session |
+  | `session=$(cc-start "task")` | Get session ID for later |
+
+  **Tool control:**
+  | Command | Description |
+  |---------|-------------|
+  | `cc-readonly "analyze this"` | Read-only tools |
+  | `cc-edit "refactor this"` | With edit capability |
+  | `cc-full "implement this"` | All tools (careful!) |
+  | `cc-with-tools "Bash,Read" "task"` | Custom tool set |
+
+  **Pipeline helpers:**
+  | Command | Description |
+  |---------|-------------|
+  | `cat file | cc-pipe "summarize"` | Pipe content to Claude |
+  | `cc-file myfile.ts "explain"` | Process specific file |
+  | `cc-diff` | Review git diff |
+  | `cc-pr-desc [base]` | Generate PR description |
+
+  **Examples:**
+  ```bash
+  # Quick codebase question
+  cq "What does the auth module do?"
+
+  # Code review with JSON output
+  cc-review "review the payment service" | jq '.result'
+
+  # Multi-turn session
+  session=$(cc-start "Review this codebase for security issues")
+  cc-resume "$session" "Focus on the API routes"
+  cc-resume "$session" "Generate a report of findings"
+
+  # PR automation
+  gh pr diff 123 | cc-pipe "Review this PR for issues"
+  ```
+
+  ### Security Notes
+
+  - Use SSH keys, never passwords
+  - Tailscale provides encrypted mesh networking
+  - `--dangerously-skip-permissions` should only be used in trusted environments
+  - Consider limiting tool access with `--allowedTools` for automated workflows
+
+  10. Keyboard Shortcuts Reference
 
   | Shortcut | Action |
   |----------|--------|
