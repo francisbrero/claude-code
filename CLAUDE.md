@@ -22,3 +22,13 @@ This is a knowledge repository for Claude Code best practices and agentic coding
 ## Target Project
 
 Phoenix (https://phoenix.hginsights.com/) - The primary project where these configurations will be applied.
+
+## Git Workflow
+
+Always use feature branches and PRs for changes:
+
+1. Create a branch: `git checkout -b feature/description`
+2. Make commits on the branch
+3. Push and create PR: `gh pr create`
+4. Wait for approval before merging
+5. Never push directly to master
