@@ -3,6 +3,12 @@
 #
 # Lightweight functions for controlling Claude Code sessions remotely.
 # No external dependencies beyond tmux (already common).
+#
+# By default, sessions use --dangerously-skip-permissions for unattended work.
+# Set CLAUDE_SAFE=1 to disable this behavior.
+
+# Default flags for claude command
+CLAUDE_DEFAULT_FLAGS="--dangerously-skip-permissions"
 
 # ============================================================================
 # Session Management
@@ -11,16 +17,21 @@
 # Start or attach to a named Claude session
 # Usage: claude-session [name] [options]
 #   name    - Session name (default: "claude")
-#   options - Passed to claude command (e.g., --dangerously-skip-permissions)
+#   options - Additional options passed to claude command
 #
 # Examples:
-#   claude-session                    # Default session
+#   claude-session                    # Default session (with skip-permissions)
 #   claude-session myproject          # Named session
-#   claude-session auto --dangerously-skip-permissions  # Unattended mode
+#   CLAUDE_SAFE=1 claude-session      # Without skip-permissions
 claude-session() {
     local name="${1:-claude}"
     shift 2>/dev/null  # Remove name from args, ignore if no args
     local claude_opts="$@"
+
+    # Add default flags unless CLAUDE_SAFE is set
+    if [[ -z "$CLAUDE_SAFE" ]]; then
+        claude_opts="$CLAUDE_DEFAULT_FLAGS $claude_opts"
+    fi
 
     # Check if session exists
     if tmux has-session -t "$name" 2>/dev/null; then
@@ -28,11 +39,7 @@ claude-session() {
         tmux attach -t "$name"
     else
         echo "Creating new session: $name"
-        if [[ -n "$claude_opts" ]]; then
-            tmux new-session -s "$name" "claude $claude_opts; exec zsh"
-        else
-            tmux new-session -s "$name" "claude; exec zsh"
-        fi
+        tmux new-session -s "$name" "claude $claude_opts; exec zsh"
     fi
 }
 
@@ -43,17 +50,18 @@ claude-bg() {
     shift 2>/dev/null
     local claude_opts="$@"
 
+    # Add default flags unless CLAUDE_SAFE is set
+    if [[ -z "$CLAUDE_SAFE" ]]; then
+        claude_opts="$CLAUDE_DEFAULT_FLAGS $claude_opts"
+    fi
+
     if tmux has-session -t "$name" 2>/dev/null; then
         echo "Session '$name' already exists. Use: tmux attach -t $name"
         return 1
     fi
 
     echo "Starting Claude in background session: $name"
-    if [[ -n "$claude_opts" ]]; then
-        tmux new-session -d -s "$name" "claude $claude_opts; exec zsh"
-    else
-        tmux new-session -d -s "$name" "claude; exec zsh"
-    fi
+    tmux new-session -d -s "$name" "claude $claude_opts; exec zsh"
     echo "Session started. Attach with: tmux attach -t $name"
 }
 
@@ -87,13 +95,19 @@ claude-kill() {
 cc() {
     local project_name=$(basename "$(pwd)")
     local session_name="cc-${project_name}"
+    local claude_opts="$@"
+
+    # Add default flags unless CLAUDE_SAFE is set
+    if [[ -z "$CLAUDE_SAFE" ]]; then
+        claude_opts="$CLAUDE_DEFAULT_FLAGS $claude_opts"
+    fi
 
     if tmux has-session -t "$session_name" 2>/dev/null; then
         echo "Attaching to: $session_name"
         tmux attach -t "$session_name"
     else
         echo "Starting Claude for project: $project_name"
-        tmux new-session -s "$session_name" "claude $@; exec zsh"
+        tmux new-session -s "$session_name" "claude $claude_opts; exec zsh"
     fi
 }
 
@@ -102,6 +116,12 @@ cc() {
 ccbg() {
     local project_name=$(basename "$(pwd)")
     local session_name="cc-${project_name}"
+    local claude_opts="$@"
+
+    # Add default flags unless CLAUDE_SAFE is set
+    if [[ -z "$CLAUDE_SAFE" ]]; then
+        claude_opts="$CLAUDE_DEFAULT_FLAGS $claude_opts"
+    fi
 
     if tmux has-session -t "$session_name" 2>/dev/null; then
         echo "Session '$session_name' already exists"
@@ -109,7 +129,7 @@ ccbg() {
     fi
 
     echo "Starting background session: $session_name"
-    tmux new-session -d -s "$session_name" "claude $@; exec zsh"
+    tmux new-session -d -s "$session_name" "claude $claude_opts; exec zsh"
     echo "Attach with: tmux attach -t $session_name"
 }
 
@@ -185,27 +205,17 @@ claude-capture() {
 }
 
 # ============================================================================
-# Unattended Mode
+# Safe Mode (without skip-permissions)
 # ============================================================================
 
-# Start Claude with skip-permissions for unattended work
-# Usage: claude-auto [name]
-# WARNING: Only use in trusted environments
-claude-auto() {
-    local name="${1:-claude-auto}"
-
-    echo "⚠️  Starting Claude with --dangerously-skip-permissions"
-    echo "    Only use this in trusted environments!"
-    echo ""
-
-    claude-session "$name" --dangerously-skip-permissions
+# Start Claude WITHOUT skip-permissions (requires manual approval)
+# Usage: cc-safe
+cc-safe() {
+    CLAUDE_SAFE=1 cc "$@"
 }
 
-# Background auto session
-# Usage: claude-auto-bg [name]
-claude-auto-bg() {
-    local name="${1:-claude-auto}"
-
-    echo "⚠️  Starting unattended Claude session: $name"
-    claude-bg "$name" --dangerously-skip-permissions
+# Background safe session
+# Usage: ccbg-safe
+ccbg-safe() {
+    CLAUDE_SAFE=1 ccbg "$@"
 }
