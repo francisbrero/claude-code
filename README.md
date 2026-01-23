@@ -31,10 +31,10 @@ Everything here is evaluated for practical incorporation into real codebases.
 ├── setup.md            # Per-repo Claude Code configuration template
 ├── laptop-setup.md     # One-time machine setup (remote sessions, worktrees)
 ├── sources.md          # Curated resources and references
-├── scripts/            # Shell helpers for remote session control
+├── remote-access/          # Remote session control from phone
 │   ├── claude-remote.zsh   # tmux session management
 │   ├── claude-headless.zsh # Headless mode wrappers
-│   └── SETUP.md            # Step-by-step remote access guide
+│   └── SETUP.md            # Step-by-step setup guide
 └── experimental/       # Research and experimental features
     └── remote-claude-sessions.md
 ```

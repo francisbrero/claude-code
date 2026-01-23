@@ -102,7 +102,7 @@ wt() {
 
 Control Claude Code sessions from your phone or other devices.
 
-See `scripts/SETUP.md` for the full step-by-step guide.
+See `remote-access/SETUP.md` for the full step-by-step guide.
 
 ### Architecture
 

@@ -11,10 +11,10 @@ This is a knowledge repository for Claude Code best practices and agentic coding
 - **setup.md** - Per-repo Claude Code configuration (hooks, skills, slash commands, dev docs)
 - **laptop-setup.md** - One-time machine setup (remote sessions, worktrees, shell helpers)
 - **sources.md** - Curated list of resources to review and incorporate
-- **scripts/** - Shell helpers for remote session control
+- **remote-access/** - Control Claude Code from your phone
   - `claude-remote.zsh` - tmux session management (`cc`, `ccbg`, `cca`)
   - `claude-headless.zsh` - Headless mode wrappers (`cq`, `cc-diff`)
-  - `SETUP.md` - Step-by-step remote access guide
+  - `SETUP.md` - Step-by-step setup guide
 - **experimental/** - Research and experimental features
 - **README.md** - Public-facing description of the repository
 
