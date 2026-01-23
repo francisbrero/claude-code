@@ -28,19 +28,37 @@ Everything here is evaluated for practical incorporation into real codebases.
 ```
 .
 ├── README.md           # This file
-├── setup.md            # Production-ready Claude Code configuration template
+├── setup.md            # Per-repo Claude Code configuration template
+├── laptop-setup.md     # One-time machine setup (remote sessions, worktrees)
 ├── sources.md          # Curated resources and references
-└── .claude/            # Example configuration (when implemented)
+├── remote-access/          # Remote session control from phone
+│   ├── claude-remote.zsh   # tmux session management
+│   ├── claude-headless.zsh # Headless mode wrappers
+│   └── SETUP.md            # Step-by-step setup guide
+└── experimental/       # Research and experimental features
+    └── remote-claude-sessions.md
 ```
 
 ## Key Components
 
-The [setup.md](setup.md) template includes:
+### Per-Repo Configuration ([setup.md](setup.md))
+
+Configuration to add to each project:
 
 1. **Fix-Issue Command** - Slash command for GitHub issue workflows
 2. **Skills System** - Auto-activated documentation and runbooks
 3. **Hooks** - Automatic skill activation, file tracking, build checking
 4. **Dev Docs System** - Context persistence across sessions
+5. **Context Window Management** - MCP guidelines, subagent patterns
+
+### One-Time Laptop Setup ([laptop-setup.md](laptop-setup.md))
+
+Machine-level configuration (run once):
+
+1. **Git Worktrees** - Run multiple Claude instances without conflicts
+2. **Remote Session Control** - Control Claude from your phone via Tailscale + Mosh
+3. **Shell Helpers** - `cc`, `ccbg`, `cca` commands for session management
+4. **Keyboard Shortcuts** - Quick reference for Claude Code
 
 ## Resources
 
