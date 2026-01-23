@@ -8,15 +8,23 @@ This is a knowledge repository for Claude Code best practices and agentic coding
 
 ## Key Files
 
-- **setup.md** - The primary output: a production-ready Claude Code configuration template including hooks, skills, slash commands, and dev docs system
+- **setup.md** - Per-repo Claude Code configuration (hooks, skills, slash commands, dev docs)
+- **laptop-setup.md** - One-time machine setup (remote sessions, worktrees, shell helpers)
 - **sources.md** - Curated list of resources to review and incorporate
+- **scripts/** - Shell helpers for remote session control
+  - `claude-remote.zsh` - tmux session management (`cc`, `ccbg`, `cca`)
+  - `claude-headless.zsh` - Headless mode wrappers (`cq`, `cc-diff`)
+  - `SETUP.md` - Step-by-step remote access guide
+- **experimental/** - Research and experimental features
 - **README.md** - Public-facing description of the repository
 
 ## Workflow
 
 1. Resources are added to `sources.md` under "To Review"
 2. After reviewing, move them to "Reviewed sources" with key takeaways
-3. Actionable patterns get incorporated into `setup.md`
+3. Actionable patterns get incorporated into:
+   - `setup.md` for per-repo configuration
+   - `laptop-setup.md` for one-time machine setup
 4. The goal is practical, tested configurations—not theoretical ideas
 
 ## Target Project
