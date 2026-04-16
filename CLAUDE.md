@@ -4,32 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Purpose
 
-This is a knowledge repository for Claude Code best practices and agentic coding patterns. It collects learnings from community resources (GitHub, Reddit, X) and distills them into production-ready configurations for use in real projects like Phoenix.
+Production-tested Claude Code configuration patterns extracted from hip-phoenix. This documents what's actually running, not theoretical ideas.
 
 ## Key Files
 
-- **setup.md** - Per-repo Claude Code configuration (hooks, skills, slash commands, dev docs)
-- **laptop-setup.md** - One-time machine setup (remote sessions, worktrees, shell helpers)
-- **sources.md** - Curated list of resources to review and incorporate
-- **remote-access/** - Control Claude Code from your phone
-  - `claude-remote.zsh` - tmux session management (`cc`, `ccbg`, `cca`)
-  - `claude-headless.zsh` - Headless mode wrappers (`cq`, `cc-diff`)
-  - `SETUP.md` - Step-by-step setup guide
-- **experimental/** - Research and experimental features
+- **setup.md** - Per-repo Claude Code configuration (hooks, skills, slash commands, dev docs, review loops)
+- **laptop-setup.md** - One-time machine setup (worktrees, keyboard shortcuts)
 - **README.md** - Public-facing description of the repository
-
-## Workflow
-
-1. Resources are added to `sources.md` under "To Review"
-2. After reviewing, move them to "Reviewed sources" with key takeaways
-3. Actionable patterns get incorporated into:
-   - `setup.md` for per-repo configuration
-   - `laptop-setup.md` for one-time machine setup
-4. The goal is practical, tested configurations—not theoretical ideas
-
-## Target Project
-
-Phoenix (https://phoenix.hginsights.com/) - The primary project where these configurations will be applied.
 
 ## Git Workflow
 
