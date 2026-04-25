@@ -9,6 +9,16 @@ I want to set up a production-quality Claude Code configuration for my project. 
 5. Dev docs system - Context persistence across sessions
 6. CLAUDE.md patterns - PR templates, review loops, permissions, guardrails
 
+### Core Principle: Subagent Delegation
+
+The dominant cost of a long Claude Code session is cache-read at Opus rates (~$1.50/MTok). At a typical 800K-token context, every broad inline grep re-reads the full cache — open-ended exploration in the main session is the most expensive shape of work you can do. The slash commands and hooks below are written around three rules:
+
+1. **Targeted lookups stay in the main context.** When you know the file path or exact symbol, use `Read` or `Bash grep` directly.
+2. **Open-ended exploration goes to an `Explore` subagent on Haiku** ("where does X live", "find callers of Y", "what implements Z"). Sidechain context is independent and Haiku is ~1/15 the input cost of Opus.
+3. **Hooks that invoke a model pin to Haiku.** Hooks fire on every prompt — defaulting to inherited Opus is a quiet, recurring cost.
+
+This is why the patterns below delegate exploration aggressively and reserve Opus for reasoning that needs the full context.
+
 Directory Structure
 
 Create this structure:
@@ -89,6 +99,11 @@ if webapp/dev/active/issue-{number}/ exists:
 - Break the issue into phases
 - Use `TaskCreate` to create tasks with dependencies for progress tracking
 - Each task gets: subject, description, activeForm, blockedBy relationships
+
+**Search delegation rules (apply throughout planning and implementation):**
+- **Targeted lookups stay in the main context.** If the issue names a file path or specific symbol, use `Read` or `Bash grep` directly. Example: the issue says "fix the bug in `src/lib/auth.ts:parseToken`" — read that file inline.
+- **Open-ended exploration goes to an `Explore` subagent on Haiku.** Spawn `Explore` (model: `haiku`) for prompts like "where does feature X live," "find callers of Y," "what files implement Z." Use `sonnet` only when the search needs medium-thoroughness reasoning (e.g., classifying matches, comparing candidate files). Do not grep broadly in the main session.
+- **Dividing-line example:** "Read `src/db/schema.ts` and add a `last_login` column" → main context. "Find every place we call the auth middleware and list which ones still use the legacy session shape" → `Explore` subagent on Haiku.
 
 **Step 6: Implement with Plan Review**
 - Implement each phase
@@ -184,15 +199,27 @@ Convert a Jira ticket to a GitHub issue.
 Input: $ARGUMENTS (Jira ticket URL or key)
 
 Steps:
-1. Fetch the Jira ticket details (use the Jira MCP or curl the API)
-2. Map Jira fields to GitHub issue format:
+1. Fetch the Jira ticket details (use the Jira MCP or curl the API).
+2. Gather repo context via a single `Explore` subagent (model: `haiku`).
+   Pass the Jira summary and ask the subagent to return:
+   - related specs under `docs/specs/`
+   - related knowledge / runbook files under `.claude/skills/`
+   - related GitHub issues (`gh issue list --search ...`, `gh search code ...`)
+   Do NOT run `find docs/specs/`, `gh search code`, or broad grep inline —
+   that work belongs in the subagent so the main Opus context stays clean.
+3. PM-coach gap analysis (stays in the main session — this is the part that
+   benefits from Opus reasoning):
+   - Compare the Jira ticket against the Explore findings.
+   - Flag missing acceptance criteria, ambiguous scope, or unstated dependencies.
+   - Propose concrete additions before filing.
+4. Map Jira fields to GitHub issue format:
    - Summary → Title
    - Description → Body (convert Jira markup to GitHub markdown)
    - Priority → Labels
    - Story points → Labels (e.g., "points:3")
    - Acceptance criteria → Checklist in body
-3. Create the issue: `gh issue create --title "..." --body "..." --label "..."`
-4. Output the new issue URL
+5. Create the issue: `gh issue create --title "..." --body "..." --label "..."`
+6. Output the new issue URL.
 ```
 
 ### /setup-instance (.claude/commands/setup-instance.md)
@@ -296,6 +323,10 @@ Skills can also enforce critical invariants. In `skill-rules.json`, use:
 - `"type": "guardrail"` — Critical invariants that must not be violated
 
 4. Hooks Configuration
+
+### Cost guidance
+
+Any hook or status-line script that invokes a Claude model must pin to Haiku. Hooks run frequently — on every prompt, every tool use, every Stop — so defaulting to inherited Opus is a quiet, recurring cost. Pinning to Haiku is ~1/15 the input cost with negligible quality impact for classification, keyword matching, or one-shot summarization tasks. If a hook genuinely needs Opus-level reasoning, that's a sign the work belongs in the main session or an `Explore` subagent, not a hook.
 
 settings.local.json
 
