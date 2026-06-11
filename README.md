@@ -29,7 +29,7 @@ What the review loops in `setup.md` look like after months in production:
 - **The `MATERIAL_FINDINGS` convergence contract** — severity-gated stop condition the wrapper agent can't re-litigate
 - **Three review passes** — plan (before code), code (`base master`, not `uncommitted`), and post-PR (what a human reviewer sees on GitHub)
 - **`codex-safe.sh`** — strip `DATABASE_URL`/`AUTH_SECRET`/API keys from the env before shelling out to an external agent
-- **Subagent scope hygiene** — the skip-list that stops review/explore subagents from burning their budget on `node_modules`
+- **Subagent scope hygiene & model-tiering** — the skip-list that stops review/explore subagents from burning budget on `node_modules`, plus matching the model tier to the work: Haiku for the high-volume retrieval phase (read the diff, grep callers, gather context), Opus only for the verdict
 - **Stop-hook gates** — derived-doc drift and live integration-test gates that catch what diff-only reviewers miss
 
 ### [laptop-setup.md](laptop-setup.md) — One-time machine setup

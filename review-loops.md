@@ -92,6 +92,19 @@ One line to paste into any `Explore` / reviewer subagent prompt:
 
 For the in-model fallback reviewer specifically, pass the equivalent as ripgrep globs (`--glob '!node_modules/**'`). The reviewer's job is to verify the diff's load-bearing claims against the code being changed — framework internals matter only when the diff itself cites a specific `file:line`.
 
+### Match the model tier to the work, not to the task label
+
+`setup.md`'s core principle — *high-volume, low-reasoning search goes to a Haiku subagent; reserve Opus for reasoning that needs the full context* — applies **inside** a review loop too, not just to standalone `Explore` calls. A review pass is rarely one homogeneous lump of "reasoning"; it's a heavy, judgment-light evidence-gathering phase followed by a small, judgment-heavy verdict.
+
+Split it on that seam:
+
+- **Haiku** for anything that reads or grabs a lot of content but barely reasons over it: collecting the diff, enumerating changed files, pulling the surrounding context for each hunk, grepping for every caller of a changed symbol, fetching the issue body and linked files. This is the bulk of the tokens and almost none of the thinking.
+- **Opus (or the main session)** only for the actual verdict: weighing whether a change is correct, classifying finding severity, deciding `MATERIAL_FINDINGS`. This is almost none of the tokens and all of the thinking.
+
+The trap is labeling the whole subagent "code review → must be Opus" and paying Opus rates to scroll through a 2,000-line diff. The *reading* of the diff is Haiku work; only the *judgment* is Opus work. If a subagent's job is overwhelmingly "search through / grab through a lot of content and report back," it's a Haiku subagent — even if it lives inside a loop you think of as high-stakes. Reserve Opus for the call where being wrong actually costs something.
+
+Rule of thumb: before spawning a subagent, ask *"does this need to reason, or just to retrieve?"* Retrieval is Haiku. Only genuine judgment earns Opus.
+
 ## 6. Stop-hook gates that pair with the loops
 
 Two Stop hooks worth adding alongside the review loops, because they catch the "the code is correct but a derived artifact drifted" class that reviewers reading only the diff tend to miss:
