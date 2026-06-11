@@ -32,6 +32,16 @@ What the review loops in `setup.md` look like after months in production:
 - **Subagent scope hygiene & model-tiering** — the skip-list that stops review/explore subagents from burning budget on `node_modules`, plus matching the model tier to the work: Haiku for the high-volume retrieval phase (read the diff, grep callers, gather context), Opus only for the verdict
 - **Stop-hook gates** — derived-doc drift and live integration-test gates that catch what diff-only reviewers miss
 
+### [sdlc-standards.md](sdlc-standards.md) — Repo-level standards an agent must respect
+
+Engineering invariants worth porting to any repo — the ones that produce confident-but-wrong agent edits when missing:
+
+- **Generated-file discipline** — one editable source → N generated outputs, each with a `DO NOT EDIT` header, a guardrail skill, and a CI drift check (TypeSpec → models; shared JSON → TS + Python)
+- **The migration *is* the deploy gate** — the load-bearing `context:` status string, trigger-coverage gaps that look like "the migration broke," and never `db:push` against deployed envs
+- **Validation decoupled from deployment** — gate the release on a scheduled nightly, with a bypass that demands and records a justification
+- **Preview-env smoke tests** — require `curl`-against-a-real-deploy evidence for REST/MCP/OAuth/webhook changes, in the PR template
+- **Fail fast at `predev`** — env validation + a `doctor` command so a broken environment is a named error, not a runtime crash
+
 ### [laptop-setup.md](laptop-setup.md) — One-time machine setup
 
 Run once per laptop:
