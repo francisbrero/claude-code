@@ -9,6 +9,8 @@ Production-tested Claude Code configuration patterns extracted from hip-phoenix.
 ## Key Files
 
 - **setup.md** - Per-repo Claude Code configuration (hooks, skills, slash commands, dev docs, review loops)
+- **review-loops.md** - Production-hardened review loops (Codex-primary/Opus-fallback reviewers, the `MATERIAL_FINDINGS` contract, three review passes, `codex-safe.sh` secret-stripping, subagent scope hygiene)
+- **sdlc-standards.md** - Repo-level engineering invariants an agent must respect (generated-file discipline, migration-as-deploy-gate, nightly→release gating, preview-env smoke tests, fail-fast env validation)
 - **laptop-setup.md** - One-time machine setup (worktrees, keyboard shortcuts)
 - **README.md** - Public-facing description of the repository
 
