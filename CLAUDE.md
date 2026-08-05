@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Purpose
 
-Production-tested Claude Code configuration patterns extracted from hip-phoenix. This documents what's actually running, not theoretical ideas.
+Production-tested Claude Code configuration patterns, extracted from a large Next.js + TypeScript monorepo running these in production. This documents what's actually running, not theoretical ideas.
+
+This repo is **public**. Do not name the private source repo, its internal URLs, or its infrastructure specifics in files, commit messages, or PR descriptions. Generalize patterns rather than copying project-specific names.
 
 ## Key Files
 

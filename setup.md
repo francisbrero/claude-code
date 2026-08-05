@@ -3,11 +3,12 @@ Overview
 I want to set up a production-quality Claude Code configuration for my project. This should include:
 
 1. Fix-issue command - A slash command to fetch and implement GitHub issues
-2. Additional commands - PR creation, Jira conversion, instance setup
+2. Additional commands - PR creation, Jira conversion, instance setup, design interrogation
 3. Skills system - Auto-activated documentation, runbooks, and technical references
-4. Hooks - Skill activation, edit tracking, build checking, guardrails, and context pre-loading
+4. Hooks - Skill activation, edit tracking, build checking, guardrails, context pre-loading, and failure-signal nudges
 5. Dev docs system - Context persistence across sessions
 6. CLAUDE.md patterns - PR templates, review loops, permissions, guardrails
+7. Committed subagents - Reviewers versioned with the repo, not the laptop
 
 ### Core Principle: Subagent Delegation
 
@@ -24,11 +25,16 @@ Directory Structure
 Create this structure:
 
 .claude/
+├── agents/                    # Subagents, committed with the repo
+│   ├── code-reviewer.md       # Gating quality review (MATERIAL_FINDINGS)
+│   ├── plan-reviewer.md       # Gating plan review (MATERIAL_FINDINGS)
+│   └── pr-impact-reviewer.md  # Descriptive blast-radius readout (never gates)
 ├── commands/
 │   ├── fix-issue.md           # /fix-issue slash command
 │   ├── create-pr.md           # /create-pr slash command
 │   ├── jira-to-github-issue.md # /jira-to-github-issue command
-│   └── setup-instance.md      # /setup-instance command
+│   ├── setup-instance.md      # /setup-instance command
+│   └── grill-me.md            # /grill-me design interrogation
 ├── hooks/
 │   ├── skill-activation-prompt.sh   # Shell wrapper
 │   ├── skill-activation-prompt.ts   # TypeScript skill matcher
@@ -42,6 +48,10 @@ Create this structure:
 │   ├── preflight-context.sh         # Pre-load relevant files on keywords
 │   ├── derived-file-drift-checker.sh # Check derived files stay in sync
 │   ├── test-gate-by-category.sh     # Remind integration tests by file category
+│   ├── instrumentation-nudge.sh     # In-turn reminder to instrument new source files
+│   ├── review-nudge.sh              # Nudge review after gh pr create / git push
+│   ├── auth-expired-nudge.sh        # Self-heal expired cloud auth sessions
+│   ├── __tests__/                   # Shell tests for the non-trivial hooks
 │   ├── package.json                 # tsx dependency
 │   └── tsconfig.json
 ├── skills/
@@ -120,6 +130,11 @@ if webapp/dev/active/issue-{number}/ exists:
 **Step 8: Create PR**
 - Use `/create-pr` command (reads PR template, fills from context)
 - Link to the original issue
+
+**Step 9: Post Impact Readout (non-gating)**
+- Run the `pr-impact-reviewer` subagent against the new PR
+- Post its output as a sticky comment via the marker-scoped helper script
+- This step **never blocks**: on any failure, note it and finish anyway (see Section 8)
 
 ### Dev Docs Templates
 
@@ -238,6 +253,45 @@ Steps:
 6. Report any issues found
 ```
 
+### /grill-me (.claude/commands/grill-me.md)
+
+Interrogate a plan or design until every branch of the decision tree is resolved. This is the front half of `/fix-issue` — use it *before* filing an issue, when the thinking is still fuzzy.
+
+```markdown
+Interview me relentlessly about a plan, design, or idea until we reach
+shared understanding. Topic: $ARGUMENTS (ask if empty).
+
+Step 1: Get a detailed description — the problem, solutions considered,
+        known constraints, what they're unsure about.
+
+Step 2: Explore the codebase FIRST. Never ask the user something the code
+        already answers. Verify claims about current state, find existing
+        patterns, identify constraints they didn't mention.
+        Delegate broad exploration to an `Explore` subagent on Haiku.
+
+Step 3: Systematic interrogation. For each topic area:
+  - Ask ONE question at a time — never dump a batch
+  - Provide a recommended answer with each question
+  - Resolve dependencies first (nail down A before asking about B)
+  - Challenge assumptions; play devil's advocate even on reasonable answers
+  - Be specific: "How will you handle X?" beats "What about error handling?"
+
+  Cover: problem framing, solution alternatives and what was ruled out,
+  architecture fit and failure modes, explicit scope boundaries, edge cases
+  and rollback, validation and success metrics, sequencing and blockers.
+
+Step 4: Synthesize — shared understanding, decisions and rationale,
+        remaining risks, next steps. Offer to write it to
+        `dev/active/[topic]/plan.md`.
+
+Rules:
+- Always recommend; never just ask "What do you think?"
+- Read the code before asking
+- Know when to stop — consistent, specific, confident answers means done
+```
+
+**Why this pairs with `/fix-issue`:** `validate-acceptance-criteria.sh` scores an issue and warns when it's underspecified. `/grill-me` is how you fix that upstream, so the issue arrives already specified. Feeding a 5/5 issue into `/fix-issue` is dramatically cheaper than discovering the ambiguity mid-implementation.
+
 3. Skills System
 
 Skill File Guidelines
@@ -293,6 +347,44 @@ References (.claude/skills/reference/):
 - Testing guidelines
 - Integration guides
 
+### Cross-Tool Skill Compatibility
+
+Skills follow the [Agent Skills standard](https://developers.openai.com/codex/skills/), so the same directory serves multiple assistants. Symlink rather than duplicate:
+
+```text
+.claude/skills/     # Primary
+.codex/skills/      # Symlink → .claude/skills/
+.gemini/skills/     # Reads .claude/skills/
+```
+
+| Tool | Instructions File | Skills Directory |
+|------|-------------------|------------------|
+| Claude Code | `CLAUDE.md` | `.claude/skills/` |
+| OpenAI Codex CLI | `AGENTS.md` | `.codex/skills/` |
+| Google Gemini CLI | `GEMINI.md` | `.gemini/skills/` |
+| GitHub Copilot | `.github/copilot-instructions.md` | N/A |
+
+Keep `CLAUDE.md` as the single source of truth and derive the others from it. Duplicated instruction files drift, and drift between assistants is worse than having one assistant.
+
+### Progressive Disclosure (Three Levels)
+
+Skills load in tiers, which is why the 500-line guidance matters:
+
+- **Level 1** — name + description, always in context (~100 words each)
+- **Level 2** — full skill body, loaded when activated
+- **Level 3** — referenced documentation, loaded on demand
+
+Every skill you add taxes Level 1 for every session, whether it activates or not. Write descriptions that discriminate, and push detail down to Level 3.
+
+### File Triggers vs. Prompt Triggers
+
+`skill-rules.json` supports both, and they have different timing:
+
+- `promptTriggers` (keywords, `intentPatterns`) — fire on `UserPromptSubmit`, i.e. *before* work starts
+- `fileTriggers` (`pathPatterns`, `pathExclusions`) — describe which files the skill governs
+
+The gap: a file trigger matched by the `UserPromptSubmit` hook can only fire on the *next* prompt, so a file written this turn escapes it. That's exactly the gap `instrumentation-nudge.sh` closes by reading the same `pathPatterns` from a `PostToolUse` hook. Declaring paths once in `skill-rules.json` and consuming them from both hooks keeps one source of truth.
+
 ### Guardrail Skills
 
 Skills can also enforce critical invariants. In `skill-rules.json`, use:
@@ -327,6 +419,15 @@ Skills can also enforce critical invariants. In `skill-rules.json`, use:
 ### Cost guidance
 
 Any hook or status-line script that invokes a Claude model must pin to Haiku. Hooks run frequently — on every prompt, every tool use, every Stop — so defaulting to inherited Opus is a quiet, recurring cost. Pinning to Haiku is ~1/15 the input cost with negligible quality impact for classification, keyword matching, or one-shot summarization tasks. If a hook genuinely needs Opus-level reasoning, that's a sign the work belongs in the main session or an `Explore` subagent, not a hook.
+
+**The strongest version of this rule is that hooks call no model at all.** Keyword matching, path globbing, and signature detection are all shell and `jq` work. Keep them there. Verify with a grep you can run in CI:
+
+```bash
+grep -rn -E '(anthropic|@anthropic-ai|claude-(opus|sonnet|haiku)|model[[:space:]]*[:=][[:space:]]*["'"'"']?(opus|sonnet|haiku))' .claude/hooks/ --exclude=README.md
+# expected: zero hits
+```
+
+The pattern catches full model IDs (`claude-opus-5`), package names (`@anthropic-ai/sdk`), and shorthand aliases (`model: "opus"`). `--exclude=README.md` skips the doc that legitimately names those strings while describing the rule. If you do add a model-calling hook, set the Haiku model ID explicitly — never rely on the inherited default.
 
 settings.local.json
 
@@ -399,6 +500,26 @@ settings.local.json
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-tool-use-tracker.sh",
             "statusMessage": "Tracking tool usage..."
+          },
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/instrumentation-nudge.sh",
+            "statusMessage": "Checking for instrumentation triggers..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/review-nudge.sh",
+            "statusMessage": "Checking for review trigger..."
+          },
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/auth-expired-nudge.sh",
+            "statusMessage": "Checking for expired auth session..."
           }
         ]
       },
@@ -478,7 +599,7 @@ settings.local.json
 3. Suggests corresponding test files
 4. Links to testing guidelines
 
-#### Additional Hooks (from hip-phoenix)
+#### Additional Hooks
 
 **validate-acceptance-criteria.sh** (UserPromptSubmit)
 
@@ -519,7 +640,7 @@ fi
 
 **domain-guardrail.sh** (UserPromptSubmit)
 
-A project-specific pattern reminder. When certain keywords are detected in the prompt, reminds Claude about domain invariants. For example, in hip-phoenix, when "agent" or "MCP" keywords are detected, it reminds about dual execution paths (server actions + MCP handlers).
+A project-specific pattern reminder. When certain keywords are detected in the prompt, reminds Claude about domain invariants. For example, if your project has dual execution paths for the same business logic, detecting the relevant keywords can remind Claude that a change may need to be applied in both.
 
 Generalize this as a keyword-to-reminder mapping:
 
@@ -659,6 +780,46 @@ if echo "$EDITED_FILES" | grep -qE 'src/app/api/'; then
 fi
 ```
 
+#### Reacting to Tool Output, Not Just Prompts
+
+The hooks above all fire on prompts or on `Stop`. A `PostToolUse` hook with `matcher: "Bash"` can do something the others can't: **read the tool's output and react to a failure signal at the moment it happens.** This is the highest-value hook shape, because it catches problems mid-task rather than one prompt too late.
+
+Three patterns worth copying:
+
+**instrumentation-nudge.sh** (PostToolUse, `Edit|MultiEdit|Write`)
+
+Skill activation on `UserPromptSubmit` can only fire on the *next* prompt — so a feature file written this turn ships uninstrumented. This hook closes that gap: when an edited file matches a skill's `fileTriggers.pathPatterns` in `skill-rules.json`, it prints a one-line reminder to add the instrumentation that skill prescribes (tracing spans, analytics events) **in the same turn the file is written**.
+
+It calls no model — it matches the path against the same `pathPatterns` the skill system already declares, so there's one source of truth. Fail-soft: missing `jq`, malformed JSON, or a missing rules file all exit 0 rather than blocking the edit. Diagnostics go to stderr; only the nudge goes to stdout.
+
+**review-nudge.sh** (PostToolUse, `Bash`)
+
+After `gh pr create`, `gh pr edit`, or `git push` completes, remind the agent to run the descriptive impact reviewer and post the readout.
+
+Implementation detail that matters: match **each command segment's leading tokens**, not a whole-string substring. Otherwise `cd x && ...`, env prefixes, and heredoc bodies produce false positives whenever a trigger word appears mid-line inside quoted text. For `git push`, resolve the current branch's open PR and no-op silently when there isn't one.
+
+**auth-expired-nudge.sh** (PostToolUse, `Bash`)
+
+When a command's output shows an expired cloud auth session, tell the agent to re-authenticate **itself** rather than handing the command back to the user.
+
+The design points here generalize well:
+
+1. **Match the tool *response*, not the command.** One expiry surfaced through four different CLIs (`aws`, `kubectl`, `helm`, `eksctl`) catches once, without enumerating commands.
+2. **Skip the remedy's own output**, so the hook can't recurse or fire on a successful re-login that echoes prior error text.
+3. **Separate definitive from ambiguous signatures.** `kubectl`'s `exec: executable aws failed` fires for *any* exec-plugin fault — expired token, wrong profile, missing binary. On ambiguous signals, hedge the wording and point at a disambiguating command instead of asserting expiry and sending the agent to re-login when the real fault is elsewhere.
+
+All three call no model, print to stdout, never block, and exit 0 on every path.
+
+#### Test the Non-Trivial Hooks
+
+Hooks with real parsing logic — command-segment tokenization, glob-to-regex conversion, signature classification — deserve tests. Keep them in `.claude/hooks/__tests__/*.test.sh` and run with plain `bash`:
+
+```bash
+bash .claude/hooks/__tests__/review-nudge.test.sh
+```
+
+This is what makes the false-positive fixes above safe to keep refining. A hook without tests silently rots into either noise or silence.
+
 ### skill-rules.json
 
 ```json
@@ -787,6 +948,19 @@ Bash(git commit:*)
 Bash(git push:*)
 ```
 
+Worth adding once you have review loops and sticky comments:
+
+```text
+Bash(gh pr edit:*)
+Bash(gh pr comment:*)
+Bash(gh issue comment:*)
+Bash(gh api repos/*/issues/*comments:*)
+Bash($CLAUDE_PROJECT_DIR/.claude/hooks/pr-impact-sticky-comment.sh:*)
+Bash($CLAUDE_PROJECT_DIR/.claude/hooks/codex-safe.sh exec:*)
+```
+
+Note the last two: allow-list the **wrapper script**, not the underlying CLI. That way the guards in Section 8 can't be bypassed by a call site that skips the wrapper.
+
 ### Dev Docs System
 
 For multi-session tasks, create a task folder:
@@ -858,7 +1032,7 @@ Subagents are delegated processes with limited scope that free up context for th
 
 ### Automated Plan/Code Review Loops
 
-The key pattern from hip-phoenix: after planning or coding, launch a subagent to review. Repeat until no material findings remain (or hit a max iteration count).
+The key pattern: after planning or coding, launch a subagent to review. Repeat until no material findings remain (or hit a max iteration count).
 
 **Plan review loop (Step 6b of /fix-issue):**
 ```
@@ -896,22 +1070,132 @@ while ROUND <= 10:
 
 ### Subagent Structure
 
+**Commit subagents to the repo, not the laptop.** Put them in `.claude/agents/` rather than `~/.claude/agents/`. A reviewer that encodes your project's invariants — which paths are high-risk, which schemas drift, which directories are generated noise — is project knowledge. It should be versioned, code-reviewed, and travel with a clone (and with a worktree, since the `wt` function copies `.claude/`).
+
 ```
-~/.claude/agents/
-  planner.md           # Break down features into tasks
-  code-reviewer.md     # Quality and style review
-  security-reviewer.md # Vulnerability analysis
-  tdd-guide.md         # Test-driven development
-  refactor-cleaner.md  # Dead code removal
+.claude/agents/
+  plan-reviewer.md         # Gating: reviews the plan (MATERIAL_FINDINGS)
+  code-reviewer.md         # Gating: quality and correctness (MATERIAL_FINDINGS)
+  pr-impact-reviewer.md    # Descriptive: blast-radius readout (never gates)
+  ui-tester.md             # Browser-driven UI verification
+```
+
+Each is a markdown file with frontmatter:
+
+```markdown
+---
+name: pr-impact-reviewer
+description: When to invoke this agent, and explicitly what it does NOT do.
+model: opus
+color: cyan
+---
+
+[System prompt: role, input contract, process, output format, degrade path]
+```
+
+### Gating vs. Descriptive Reviewers
+
+Not every reviewer should be able to block. Splitting these is the pattern most worth stealing:
+
+| Aspect | Gating | Descriptive |
+| --- | --- | --- |
+| Examples | `plan-reviewer`, `code-reviewer` | `pr-impact-reviewer` |
+| Emits `MATERIAL_FINDINGS` | Yes | **Never** |
+| Can block the loop | Yes | No |
+| Consumer | The convergence loop | A human reading the PR |
+| On failure | Surfaces the problem | Degrades to a note, loop continues |
+
+A descriptive reviewer answers "how scary is this change?" — a question with no pass/fail answer, so wiring it into a gate produces either noise or false confidence. Keeping it purely descriptive means it can be opinionated and blunt without ever wedging the pipeline.
+
+**Impact readout format** — the reviewer *returns* this text; the orchestration layer posts it:
+
+```markdown
+<!-- pr-impact-review -->
+## PR Impact & Risk Readout
+
+**Risk:** <one verbatim label>
+
+### What changed and why it matters
+<2–5 sentences, plain English, aimed at a teammate who did not write the code.
+What the change does and what part of the system it touches — not a diff recap.>
+
+### What to double-check
+- <bullet>
+```
+
+The leading HTML marker is load-bearing: a small helper script (`gh api ... PATCH -F body=@file`) finds the comment by marker and edits it in place, so re-runs update one sticky comment instead of spamming the PR.
+
+Pick the risk label by **reasoning about blast radius**, not by scoring a checklist: what breaks if this is wrong, who is affected, how reversible is it. Higher-risk signals to weigh — schema changes and migrations, auth and session paths, tool input/output schemas, billing, infra and deploy config, multi-tenant isolation. Lower-risk — docs, comments, tests, isolated additive UI.
+
+One more thing worth copying: give the labels personality so they actually land. A blunt, slightly irreverent label set — escalating from a shrug at the low end to something that names the consequence of not reviewing at the high end — gets read where `Risk: Medium` gets scrolled past. Whatever wording you pick, define the labels as a fixed set of **exact strings** so downstream tooling can match on them.
+
+### Two-Stage Delegation (Haiku reads, Opus judges)
+
+For any reviewer that must consume a large diff, split the work by model. Reading is cheap high-volume token work; judgment is the expensive part.
+
+1. **Stage 1 (Haiku):** the Opus agent gathers raw material (`gh pr view --json files,additions,deletions`, `gh pr diff`), then spawns an `Explore` subagent pinned to `haiku` and hands it the diff text. Haiku returns a compact structured summary — per changed area: which files, what kind of change, any risk signals it noticed.
+2. **Stage 2 (Opus):** consumes Haiku's summary plus the file list and writes the judgment.
+
+Skip Stage 1 when the diff is small enough that a subagent adds no value — but delegating the read is the default.
+
+For very large diffs, fetch per-file via `gh api repos/<owner>/<repo>/pulls/<number>/files` rather than one giant `gh pr diff`.
+
+### Scope Hygiene: Tell Subagents What to Ignore
+
+Every reviewer prompt should carry an explicit ignore list, and should pass it down to any subagent it spawns. Without one, agents crawl generated trees and burn tokens producing nothing:
+
+```text
+node_modules/, .git/, .next/, .turbo/, dist/, build/
+<generated docs output>/
+<generated types>/
+<migration snapshot JSON>
+dev/active/, dev/completed/       # dev-docs scratchpad
+coverage/, test-results/, playwright-report/
+*.lock, pnpm-lock.yaml, package-lock.json, yarn.lock
+```
+
+A diff may legitimately touch generated files (a migration, for instance) — note that in the summary, but don't crawl the surrounding tree.
+
+### Degrade Paths
+
+Every optional reviewer needs an explicit degrade path in its prompt. Spell out that on any failure — model error, empty diff, unresolvable PR number — it must **return** a labeled note rather than throw:
+
+```markdown
+<!-- pr-impact-review -->
+## PR Impact & Risk Readout
+
+_Impact review unavailable: <one-line reason>._
+```
+
+Without this instruction, a transient failure in an optional step takes down a loop that had no dependency on it.
+
+### Wrapping External CLI Agents
+
+If a review loop calls a non-Claude CLI (Codex, Gemini) as a second opinion, wrap it in a single guard script instead of repeating flags at each call site. Every call site that has to remember a guard eventually forgets one. A wrapper like `codex-safe.sh` should enforce three:
+
+1. **Strip credentials** — `env -u` each secret before exec'ing the CLI.
+2. **Close stdin** (`</dev/null`) when stdin is a non-TTY pipe. `codex exec` appends piped stdin to the positional prompt; inside a Claude Code subagent the shell's stdin is an open pipe that never reaches EOF, so it blocks forever waiting on input that never arrives. The failure mode is silent — a long hang producing zero output, which looks like a slow review rather than a wedged one. Leave an interactive TTY alone, and provide an env var to opt back in for callers that genuinely pipe input.
+3. **Bound wall-clock time.** macOS ships neither `timeout` nor `gtimeout`, so a `timeout ...` guard written into an agent definition is **inert** — the hang it was meant to bound isn't. Use perl's `alarm`, which is always present, and kill the whole process group so a wedged child can't outlive the parent.
+
+Exit codes should follow shell convention so callers can distinguish outcomes: `124` for timeout, `128+signal` for signal death (**not** reported as success), otherwise the CLI's own code.
+
+Add the wrapper to the permissions allow-list rather than the raw CLI:
+
+```text
+Bash($CLAUDE_PROJECT_DIR/.claude/hooks/codex-safe.sh exec:*)
 ```
 
 ### Subagent Design Principles
 
 1. **Limit tools** - Give subagents only the tools they need
 2. **Limit MCPs** - Subagents should have minimal/no MCPs
-3. **Clear scope** - Define exactly what the subagent should do
+3. **Clear scope** - Define exactly what the subagent should do, and explicitly what it must NOT do
 4. **Return format** - Specify how results should be reported back
 5. **Convergence** - Use the `MATERIAL_FINDINGS: true/false` pattern to know when to stop
+6. **Read-only by default** - State plainly that the agent returns text and does not write files or post comments; orchestration handles side effects
+7. **Degrade, never crash** - Optional reviewers return a labeled note on failure
+8. **Delegate the reading** - Pin bulk diff/file reading to Haiku; reserve Opus for judgment
+9. **Commit them** - `.claude/agents/`, versioned with the code they review
 
 ### Implementation Notes
 
@@ -925,6 +1209,12 @@ while ROUND <= 10:
 
 5. **Gitignore** - Add `webapp/dev/active/` and `webapp/dev/completed/` to `.gitignore`
 
+6. **Commit `.claude/agents/`** - Subagents encode project invariants; version them with the code
+
+7. **Test the parsing hooks** - Any hook doing tokenization or glob conversion gets a `__tests__/*.test.sh`
+
+8. **Verify no hook calls a model** - Run the grep from the Cost guidance section in CI
+
 ---
 
 This setup provides:
@@ -935,7 +1225,9 @@ This setup provides:
 - **Context efficiency** - MCPs managed, subagents for isolated tasks
 - **Guardrails** - Domain-specific invariants enforced via hooks and skills
 - **Session resilience** - Resume from checkpoints, error pattern detection
+- **Failure-signal self-healing** - Hooks that read tool output and fix auth/instrumentation gaps in-turn
+- **Human-readable risk** - Descriptive impact readouts that inform without gating
 
 ---
 
-**Note:** For one-time laptop setup (git worktrees, keyboard shortcuts), see `laptop-setup.md`.
+**Note:** For one-time laptop setup (git worktrees, custom status line, usage monitoring, keyboard shortcuts), see `laptop-setup.md`.
