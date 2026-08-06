@@ -13,6 +13,8 @@ This repo is **public**. Do not name the private source repo, its internal URLs,
 ## Key Files
 
 - **setup.md** - Per-repo Claude Code configuration (hooks, skills, slash commands, subagents, dev docs, review loops)
+- **review-loops.md** - Production-hardened review loops (external-primary/in-model-fallback reviewers, the `MATERIAL_FINDINGS` contract, three review passes, credential-stripping wrapper, subagent scope hygiene)
+- **sdlc-standards.md** - Repo-level engineering invariants an agent must respect (generated-file discipline, migration-as-deploy-gate, nightly→release gating, preview-env smoke tests, fail-fast env validation)
 - **laptop-setup.md** - One-time machine setup (worktrees, status line, usage monitoring, keyboard shortcuts)
 - **README.md** - Public-facing description of the repository
 
