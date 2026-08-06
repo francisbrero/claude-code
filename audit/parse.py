@@ -11,7 +11,7 @@ import glob
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pricing import cost_of, cost_without_cache, family_of
 
@@ -148,6 +148,10 @@ def parse_session(path):
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # A line can be valid JSON but not an object (`[]`, `"x"`, `null`).
+            # Everything below assumes a dict, so skip anything else.
+            if not isinstance(d, dict):
+                continue
 
             s.session_id = s.session_id or d.get("sessionId")
             s.cwd = s.cwd or d.get("cwd")
@@ -158,8 +162,21 @@ def parse_session(path):
 
             if kind == "assistant":
                 msg = d.get("message") or {}
+                if not isinstance(msg, dict):
+                    continue
                 usage = msg.get("usage") or {}
+                if not isinstance(usage, dict):
+                    continue
                 creation = usage.get("cache_creation") or {}
+                # `cache_creation` is the per-TTL split; `cache_creation_input_tokens`
+                # is the documented total. They agree when both are present, but the
+                # split can be absent — in which case attribute the total to the 5m
+                # bucket (the default TTL) rather than silently counting zero.
+                w5m = creation.get("ephemeral_5m_input_tokens", 0) or 0
+                w1h = creation.get("ephemeral_1h_input_tokens", 0) or 0
+                declared = usage.get("cache_creation_input_tokens", 0) or 0
+                if declared and (w5m + w1h) == 0:
+                    w5m = declared
                 tools = [
                     p.get("name")
                     for p in msg.get("content", [])
@@ -177,8 +194,8 @@ def parse_session(path):
                     model=model,
                     family=family_of(model),
                     raw_input=usage.get("input_tokens", 0) or 0,
-                    cache_write_5m=creation.get("ephemeral_5m_input_tokens", 0) or 0,
-                    cache_write_1h=creation.get("ephemeral_1h_input_tokens", 0) or 0,
+                    cache_write_5m=w5m,
+                    cache_write_1h=w1h,
                     cache_read=usage.get("cache_read_input_tokens", 0) or 0,
                     output=usage.get("output_tokens", 0) or 0,
                     is_sidechain=bool(d.get("isSidechain")),
@@ -252,9 +269,16 @@ def load_sessions(root=None, since_days=None, limit=None):
     first occurrence of each request and drop the rest. Files sharing a
     sessionId are merged into one Session, since they are one conversation.
     """
+    # File mtime only decides which files are worth opening. A resumed session
+    # replays old history into a freshly-written file, so the real window filter
+    # has to be applied per call, using the call's own timestamp.
     paths = find_transcripts(root, since_days)
     if limit:
         paths = paths[:limit]
+
+    cutoff = None
+    if since_days:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
 
     seen_requests = set()
     merged = {}
@@ -265,6 +289,8 @@ def load_sessions(root=None, since_days=None, limit=None):
 
         fresh = []
         for c in s.calls:
+            if cutoff and c.ts and c.ts < cutoff:
+                continue  # replayed history from before the window
             # Calls with no requestId can't be dedup-keyed; keep them, they are rare.
             if c.request_id:
                 if c.request_id in seen_requests:
@@ -276,15 +302,28 @@ def load_sessions(root=None, since_days=None, limit=None):
         if key in merged:
             base = merged[key]
             base.calls.extend(fresh)
-            # Tool results and turn counts are replayed in forked files too, so
-            # take the richest single file's view rather than summing.
-            if len(s.tool_results) > len(base.tool_results):
-                base.tool_results = s.tool_results
+            # Tool results are replayed across forked files, so they can't simply
+            # be summed. But taking only the largest file's view would discard
+            # branch-specific results that exist in no other file. Dedupe on the
+            # result's own identity instead, keeping the union.
+            base.tool_results.extend(s.tool_results)
             base.user_turns = max(base.user_turns, s.user_turns)
             base.compactions = max(base.compactions, s.compactions)
             base.skills_used |= s.skills_used
         else:
             s.calls = fresh
             merged[key] = s
+
+    # Collapse replayed tool results now that every fork has been folded in.
+    for s in merged.values():
+        seen = set()
+        unique = []
+        for r in s.tool_results:
+            sig = (r.name, r.chars, r.is_error)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            unique.append(r)
+        s.tool_results = unique
 
     return [s for s in merged.values() if s.calls]

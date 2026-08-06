@@ -38,6 +38,27 @@ def _pct(n, d):
     return 100.0 * n / d if d else 0.0
 
 
+def blended_input_price(calls):
+    """Input $/token, weighted by tokens actually consumed on each model.
+
+    An unweighted mean over calls prices a Haiku call the same as an Opus call,
+    which is wrong by up to 15x when a workload mixes tiers: thousands of small
+    cheap subagent calls would drag the effective price far below what the
+    expensive calls actually consuming the tokens really cost.
+    """
+    total_tokens = 0
+    total_cost = 0.0
+    for c in calls:
+        toks = c.total_input
+        if toks <= 0:
+            continue
+        total_tokens += toks
+        total_cost += toks * prices_for(c.model)[0] / 1e6
+    if not total_tokens:
+        return 0.0
+    return total_cost / total_tokens
+
+
 def _money(x):
     if x >= 100:
         return f"${x:,.0f}"
@@ -79,7 +100,7 @@ def cache_hit_rate(ctx):
     if hit < 90 and write > read * 0.15:
         excess = write - (read + write) * 0.10
         if excess > 0:
-            per_tok = statistics.mean([prices_for(c.model)[0] for c in calls]) / 1e6
+            per_tok = blended_input_price(calls)
             savings = excess * per_tok * (CACHE_WRITE_5M_MULT - CACHE_READ_MULT)
 
     if hit >= 90:
@@ -152,7 +173,7 @@ def cache_ttl(ctx):
 
     # The 1h premium only pays off in the 5-60min band. Everywhere else it is
     # pure markup: 2.0x vs 1.25x = 0.75x base input wasted.
-    per_tok = statistics.mean([prices_for(c.model)[0] for c in calls]) / 1e6
+    per_tok = blended_input_price(calls)
     wasted_share = _pct(under5 + over60, len(gaps)) / 100
     savings = w1h * per_tok * (CACHE_WRITE_1H_MULT - CACHE_WRITE_5M_MULT) * wasted_share
 
@@ -227,7 +248,7 @@ def worktree_cache_cost(ctx):
     if not cold_count:
         return None
 
-    per_tok = statistics.mean([prices_for(c.model)[0] for c in ctx.calls]) / 1e6
+    per_tok = blended_input_price(ctx.calls)
     # Cold-start writes are unavoidable in principle, but sessions fragmented
     # across many dirs multiply them. Model the excess as the cold starts beyond
     # one per directory.
@@ -463,17 +484,21 @@ def context_bloat(ctx):
         return None
 
     median = statistics.median(baselines)
-    per_tok = statistics.mean([prices_for(c.model)[0] for c in ctx.calls]) / 1e6
+    per_tok = blended_input_price(ctx.calls)
 
-    # Everything above a lean ~25K baseline is avoidable, paid once per session
-    # as a write plus on every turn as a read.
+    # Everything above a lean ~25K baseline is avoidable. It is paid twice: once
+    # per session as a cache write, and again on every turn as a cache read.
+    #
+    # Only the WRITE half is claimed here. The per-turn read half is already
+    # billed by session_hygiene / runaway_context, which charge for total context
+    # size above 100K — and the baseline is part of that total. Claiming both
+    # would double-count the same tokens across findings, so the reported saving
+    # is deliberately the smaller, non-overlapping number.
     LEAN = 25_000
     excess = max(0, median - LEAN)
     turns = sum(len(s.main_calls) for s in ctx.sessions)
-    savings = (
-        excess * len(ctx.sessions) * per_tok * CACHE_WRITE_5M_MULT
-        + excess * turns * per_tok * CACHE_READ_MULT
-    )
+    savings = excess * len(ctx.sessions) * per_tok * CACHE_WRITE_5M_MULT
+    read_half = excess * turns * per_tok * CACHE_READ_MULT
 
     if excess <= 0:
         sev = "ok"
@@ -502,6 +527,10 @@ def context_bloat(ctx):
             f"Median baseline here: **{_tokens(median)}** tokens across {len(ctx.sessions)} "
             f"sessions and {turns:,} main-thread turns. A lean setup lands near "
             f"{_tokens(LEAN)}.\n\n"
+            f"Trimming it saves {_money(savings)} in cache writes, plus a further "
+            f"~{_money(read_half)} in per-turn cache reads — that read saving is "
+            "already counted under the session-context findings above, so it is not "
+            "added again here.\n\n"
             + (f"MCP tool definitions are a common hidden bulk — **{mcp} tools** are "
                "currently exposed. Every one of their schemas sits in the prefix whether "
                "or not it is ever called.\n" if mcp else "")
@@ -539,7 +568,7 @@ def session_hygiene(ctx):
     # the two findings never bill the same tokens twice.
     CEILING = 100_000
     RUNAWAY = 200_000
-    per_tok = statistics.mean([prices_for(c.model)[0] for c in ctx.calls]) / 1e6
+    per_tok = blended_input_price(ctx.calls)
     excess_reads = sum(
         max(0, min(c.total_input, RUNAWAY) - CEILING)
         for s in ctx.sessions for c in s.main_calls
@@ -608,7 +637,7 @@ def tool_output_waste(ctx):
     avg_turns_after = statistics.mean(
         [max(1, len(s.main_calls) / 2) for s in ctx.sessions]
     )
-    per_tok = statistics.mean([prices_for(c.model)[0] for c in ctx.calls]) / 1e6
+    per_tok = blended_input_price(ctx.calls)
     savings = est_tokens * avg_turns_after * per_tok * CACHE_READ_MULT * 0.5
 
     by_tool = Counter()
