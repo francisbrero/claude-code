@@ -267,13 +267,6 @@ def spend_overview(ctx):
     return rows
 
 
-VERDICT_LABEL = {
-    "supported": "✅ Supported",
-    "unsupported": "⚠️ Unsupported",
-    "contradicted": "❌ Contradicted by your config",
-}
-
-
 def render(ctx, findings, days, verdicts=None):
     sessions = ctx.sessions
     calls = ctx.calls
@@ -406,30 +399,23 @@ def render(ctx, findings, days, verdicts=None):
         for v in verdicts.get("verdicts", []):
             by_key[v.get("finding_key")] = v
 
-        challenged = [v for v in by_key.values()
-                      if v.get("verdict") in ("unsupported", "contradicted")]
-        out.append("## Challenge pass\n")
-        out.append(
-            "An LLM reviewed each recommendation against this setup's actual "
-            "configuration. It cannot change any number — it only rules on whether "
-            "a recommendation is supported by the evidence.\n"
-        )
-        if challenged:
+        # Only surface what changes the reader's decision: which findings are
+        # the same lever (so their savings can't be added up). The per-finding
+        # verdicts are applied silently above, not narrated here.
+        shared = verdicts.get("shared_root_causes") or []
+        if shared:
+            out.append("## Don't double-count these\n")
             out.append(
-                f"**{len(challenged)} of {len(by_key)} recommendations did not "
-                "survive.** Details are attached to each finding below.\n"
+                "Some findings describe one underlying problem at different "
+                "granularities. Fixing the root cause captures all of them — "
+                "adding their savings together overstates the total.\n"
             )
-        else:
-            out.append("All recommendations survived scrutiny.\n")
-
-        for shared in verdicts.get("shared_root_causes", []) or []:
-            keys = ", ".join(f"`{k}`" for k in shared.get("finding_keys", []))
-            out.append(f"- **Shared root cause** ({keys}): {shared.get('why', '')}")
-        if verdicts.get("shared_root_causes"):
+            title_of = {f.key: f.title for f in findings}
+            for group in shared:
+                keys = group.get("finding_keys", [])
+                names = ", ".join(f"**{title_of.get(k, k)}**" for k in keys)
+                out.append(f"- {names} — {group.get('why', '')}")
             out.append("")
-
-        if verdicts.get("overall"):
-            out.append(f"> {verdicts['overall']}\n")
 
     # --- Findings -------------------------------------------------------
     out.append("## Findings\n")
@@ -442,15 +428,16 @@ def render(ctx, findings, days, verdicts=None):
             out.append(f.detail + "\n")
         if f.table:
             out.append(md_table(f.table) + "\n")
-        if f.fix:
-            out.append(f"**Fix:** {f.fix}\n")
-
+        # When the critic overturned a recommendation, show only the corrected
+        # one. Printing the original next to a "revised" version doubles the
+        # reading and makes the reader adjudicate a disagreement they have no
+        # way to settle.
         v = by_key.get(f.key)
-        if v and v.get("verdict") != "supported":
-            label = VERDICT_LABEL.get(v.get("verdict"), v.get("verdict", "?"))
-            out.append(f"> **Challenge — {label}.** {v.get('why', '')}\n")
-            if v.get("revised_recommendation"):
-                out.append(f"> **Revised:** {v['revised_recommendation']}\n")
+        revised = (v or {}).get("revised_recommendation")
+        if revised and v.get("verdict") != "supported":
+            out.append(f"**Fix:** {revised}\n")
+        elif f.fix:
+            out.append(f"**Fix:** {f.fix}\n")
 
     if healthy:
         out.append("## Already healthy\n")

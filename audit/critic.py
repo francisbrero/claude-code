@@ -46,20 +46,27 @@ Reserve `contradicted` for a claim the evidence actually disproves, and
 
 Never invent numbers. Cite only fields present in the packet.
 
+IMPORTANT — `revised_recommendation` REPLACES the original in the report. The
+reader never sees the version you rejected, so do not write it as a rebuttal.
+Write it as the instruction they should follow: what to change, where, and why
+it is right for *this* setup. No "instead of", no "actually", no reference to
+the original recommendation. If the original was fine, return null.
+
+Keep every revised recommendation under 60 words and lead with the action.
+
 Return ONLY valid JSON:
 {
   "verdicts": [
     {
       "finding_key": "...",
       "verdict": "supported" | "unsupported" | "contradicted",
-      "why": "one or two sentences, citing the evidence field that decides it",
-      "revised_recommendation": "... or null if unchanged"
+      "why": "one sentence, citing the evidence field that decides it",
+      "revised_recommendation": "the corrected instruction, or null if unchanged"
     }
   ],
   "shared_root_causes": [
-    {"finding_keys": ["a","b"], "why": "..."}
-  ],
-  "overall": "2-4 sentences: what to do first, and what the numbers do not support."
+    {"finding_keys": ["a","b"], "why": "one sentence on the shared mechanism"}
+  ]
 }"""
 
 

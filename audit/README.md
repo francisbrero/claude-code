@@ -29,10 +29,14 @@ python3 cc_audit.py --days 30 --challenge
 python3 cc_audit.py --show-packet          # see exactly what would be sent
 ```
 
-Each recommendation comes back `supported`, `unsupported`, or `contradicted`,
-with the evidence field that decides it, plus a revised recommendation where the
-original was wrong. It also flags findings that share a root cause, whose savings
-therefore should not be summed.
+When a recommendation is overturned, the corrected one **silently replaces** it.
+The report never shows both — a finding that says "do X" and then "actually do Y"
+just makes the reader adjudicate a disagreement they have no way to settle. You
+get one instruction per finding, either way.
+
+The only thing the pass adds to the report is a **"Don't double-count these"**
+section listing findings that are one problem seen at different granularities,
+so their savings aren't summed.
 
 **The critic never computes or adjusts a number.** The deterministic pass owns
 all arithmetic; the critic only rules on whether a recommendation is supported.
