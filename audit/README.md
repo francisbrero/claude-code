@@ -15,6 +15,54 @@ python3 cc_audit.py --out me.md
 python3 cc_audit.py --json          # machine-readable, for aggregating across a team
 ```
 
+## Challenging the recommendations (`--challenge`)
+
+The analysis is deterministic: fixed thresholds, no model, no network. That makes
+the numbers auditable, but it also means a recommendation can assert something
+about your setup that is simply false — "create an explore agent" when you have
+forty, or "pin this reviewer to Sonnet" when that pin is a Codex fallback tier.
+
+`--challenge` sends the findings to an LLM whose only job is to **attack** them:
+
+```bash
+python3 cc_audit.py --days 30 --challenge
+python3 cc_audit.py --show-packet          # see exactly what would be sent
+```
+
+Each recommendation comes back `supported`, `unsupported`, or `contradicted`,
+with the evidence field that decides it, plus a revised recommendation where the
+original was wrong. It also flags findings that share a root cause, whose savings
+therefore should not be summed.
+
+**The critic never computes or adjusts a number.** The deterministic pass owns
+all arithmetic; the critic only rules on whether a recommendation is supported.
+That boundary is what keeps the figures reproducible.
+
+### What gets sent — config, never conversation
+
+The packet is **~4K tokens of configuration and counters**. It is built from
+structured fields only, so transcripts cannot leak into it by construction:
+
+| Sent | Never sent |
+|---|---|
+| Agent names, scopes, pinned models, descriptions | Prompts, replies, thinking |
+| How agents were spawned, and with what override | Tool results, file contents, diffs |
+| Settings/env var **names** (values redacted) | File paths, shell commands, URLs |
+| Token counts, costs, ratios, severities | Repo names, session IDs |
+
+Agent *descriptions* are included deliberately — that is where "this reviewer
+uses Codex first" is written, and without it the critic cannot tell a pricing
+choice from a fallback tier.
+
+A regex guard scans the machine-derived fields before anything is sent and
+**aborts the run** if a path, source filename, URL, or shell command appears.
+Use `--show-packet` to inspect the payload yourself; it prints and exits without
+contacting anything.
+
+Runs through the already-authenticated `claude` CLI, so there is no API key to
+manage. If the CLI is missing or fails, the run warns and the deterministic
+report is written unchanged.
+
 ## Stored reports
 
 Every run saves a dated copy under `~/.claude/cc-audit-reports/<user-id>/`, so

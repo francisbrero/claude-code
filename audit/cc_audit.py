@@ -23,6 +23,8 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agents  # noqa: E402
+import critic  # noqa: E402
+import evidence  # noqa: E402
 import store  # noqa: E402
 from checks import _money, _tokens, build_findings  # noqa: E402
 from parse import find_transcripts, load_sessions, parse_session, repo_of  # noqa: E402
@@ -265,7 +267,14 @@ def spend_overview(ctx):
     return rows
 
 
-def render(ctx, findings, days):
+VERDICT_LABEL = {
+    "supported": "✅ Supported",
+    "unsupported": "⚠️ Unsupported",
+    "contradicted": "❌ Contradicted by your config",
+}
+
+
+def render(ctx, findings, days, verdicts=None):
     sessions = ctx.sessions
     calls = ctx.calls
     starts = [s.start for s in sessions if s.start]
@@ -391,6 +400,37 @@ def render(ctx, findings, days):
             ))
         out.append(md_table(rows) + "\n")
 
+    # --- Critic verdicts ------------------------------------------------
+    by_key = {}
+    if verdicts:
+        for v in verdicts.get("verdicts", []):
+            by_key[v.get("finding_key")] = v
+
+        challenged = [v for v in by_key.values()
+                      if v.get("verdict") in ("unsupported", "contradicted")]
+        out.append("## Challenge pass\n")
+        out.append(
+            "An LLM reviewed each recommendation against this setup's actual "
+            "configuration. It cannot change any number — it only rules on whether "
+            "a recommendation is supported by the evidence.\n"
+        )
+        if challenged:
+            out.append(
+                f"**{len(challenged)} of {len(by_key)} recommendations did not "
+                "survive.** Details are attached to each finding below.\n"
+            )
+        else:
+            out.append("All recommendations survived scrutiny.\n")
+
+        for shared in verdicts.get("shared_root_causes", []) or []:
+            keys = ", ".join(f"`{k}`" for k in shared.get("finding_keys", []))
+            out.append(f"- **Shared root cause** ({keys}): {shared.get('why', '')}")
+        if verdicts.get("shared_root_causes"):
+            out.append("")
+
+        if verdicts.get("overall"):
+            out.append(f"> {verdicts['overall']}\n")
+
     # --- Findings -------------------------------------------------------
     out.append("## Findings\n")
     for i, f in enumerate(actionable, 1):
@@ -404,6 +444,13 @@ def render(ctx, findings, days):
             out.append(md_table(f.table) + "\n")
         if f.fix:
             out.append(f"**Fix:** {f.fix}\n")
+
+        v = by_key.get(f.key)
+        if v and v.get("verdict") != "supported":
+            label = VERDICT_LABEL.get(v.get("verdict"), v.get("verdict", "?"))
+            out.append(f"> **Challenge — {label}.** {v.get('why', '')}\n")
+            if v.get("revised_recommendation"):
+                out.append(f"> **Revised:** {v['revised_recommendation']}\n")
 
     if healthy:
         out.append("## Already healthy\n")
@@ -476,6 +523,13 @@ def main():
                     help=f"where to store dated reports (default: {store.DEFAULT_ROOT})")
     ap.add_argument("--no-store", action="store_true",
                     help="don't save a dated copy of this report")
+    ap.add_argument("--challenge", action="store_true",
+                    help="ask an LLM to challenge the recommendations against your "
+                         "actual config (sends config + counters, never transcripts)")
+    ap.add_argument("--challenge-model", default="sonnet", metavar="MODEL",
+                    help="model for the critic pass (default: sonnet)")
+    ap.add_argument("--show-packet", action="store_true",
+                    help="print exactly what --challenge would send, then exit")
     ap.add_argument("--trend", action="store_true",
                     help="show stored reports over time, then exit")
     ap.add_argument("--all-users", action="store_true",
@@ -521,11 +575,37 @@ def main():
           file=sys.stderr)
     findings = build_findings(ctx)
 
-    report = render(ctx, findings, args.days)
+    payload = to_json(ctx, findings, args.days)
+
+    verdicts = None
+    if args.challenge or args.show_packet:
+        packet = evidence.build(ctx, findings, store.sanitize(payload, ctx))
+
+        # Hard gate: never send anything that looks like conversation content,
+        # even if a future change to the packet builder lets one through.
+        leaks = evidence.find_leaks(packet)
+        if leaks:
+            print(f"error: refusing to send — packet contains {len(leaks)} value(s) "
+                  f"that look like file paths or commands: {leaks[:3]}",
+                  file=sys.stderr)
+            return 2
+
+        if args.show_packet:
+            print(json.dumps(packet, indent=2, sort_keys=True))
+            return 0
+
+        print(f"Challenging {len(findings)} recommendations "
+              f"({len(json.dumps(packet)) // 4:,} tokens)…", file=sys.stderr)
+        try:
+            verdicts = critic.review(packet, model=args.challenge_model)
+        except critic.CriticUnavailable as exc:
+            print(f"warning: {exc}", file=sys.stderr)
+            print("         the deterministic report below is unaffected.",
+                  file=sys.stderr)
+
+    report = render(ctx, findings, args.days, verdicts)
     with open(args.out, "w") as fh:
         fh.write(report)
-
-    payload = to_json(ctx, findings, args.days)
 
     stored = None
     if not args.no_store:
