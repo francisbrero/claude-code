@@ -69,11 +69,39 @@ class Call:
 
 @dataclass
 class ToolResult:
-    """A tool result that landed in context, with its size in characters."""
+    """A tool result that landed in context, with its size and what produced it.
+
+    `target` is the file path (Read/Grep) or command (Bash) behind the result.
+    Without it a report can only say "you read too much"; with it, the report can
+    name the file to stop reading.
+    """
 
     name: str
     chars: int
     is_error: bool
+    target: str = ""
+    repo: str = ""
+
+    IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
+
+    @property
+    def is_image(self):
+        return self.target.lower().endswith(self.IMAGE_EXT)
+
+    @property
+    def kind(self):
+        """Coarse bucket used to pick the right remediation."""
+        t = self.target.lower()
+        if self.is_image:
+            return "image"
+        if "/skills/" in t or "/docs/dev/" in t or t.endswith("claude.md"):
+            return "instructions"
+        if any(seg in t for seg in ("/node_modules/", "/dist/", "/build/", "/.next/",
+                                    "test-results", "/coverage/", ".lock")):
+            return "generated"
+        if self.name == "Bash":
+            return "command"
+        return "file"
 
 
 def repo_of(cwd):
@@ -164,6 +192,7 @@ def _result_text(part):
 def parse_session(path):
     """Read one transcript file into a Session. Malformed lines are skipped."""
     s = Session(path=path)
+    pending_targets = {}  # tool_use_id -> (tool name, target)
     try:
         fh = open(path, errors="replace")
     except OSError:
@@ -207,11 +236,24 @@ def parse_session(path):
                 declared = usage.get("cache_creation_input_tokens", 0) or 0
                 if declared and (w5m + w1h) == 0:
                     w5m = declared
-                tools = [
-                    p.get("name")
-                    for p in msg.get("content", [])
-                    if isinstance(p, dict) and p.get("type") == "tool_use"
-                ]
+                tools = []
+                for p in msg.get("content", []) or []:
+                    if not isinstance(p, dict) or p.get("type") != "tool_use":
+                        continue
+                    tools.append(p.get("name"))
+                    # Remember what this call targeted so the matching
+                    # tool_result (which doesn't say) can be attributed.
+                    inp = p.get("input") or {}
+                    if isinstance(inp, dict):
+                        target = (
+                            inp.get("file_path")
+                            or inp.get("pattern")
+                            or inp.get("command")
+                            or inp.get("path")
+                            or ""
+                        )
+                        if p.get("id"):
+                            pending_targets[p["id"]] = (p.get("name"), str(target))
                 model = msg.get("model") or "unknown"
                 if model == "<synthetic>":
                     continue  # not a billed call
@@ -247,10 +289,15 @@ def parse_session(path):
                         if not isinstance(part, dict):
                             continue
                         if part.get("type") == "tool_result":
+                            tool_name, target = pending_targets.get(
+                                part.get("tool_use_id"), (None, "")
+                            )
                             s.tool_results.append(ToolResult(
-                                name=_tool_name_for(d),
+                                name=tool_name or _tool_name_for(d),
                                 chars=len(_result_text(part)),
                                 is_error=bool(part.get("is_error")),
+                                target=target,
+                                repo=repo_of(d.get("cwd") or s.cwd),
                             ))
                         elif part.get("type") == "text":
                             s.user_turns += 1
@@ -395,7 +442,7 @@ def load_sessions(root=None, since_days=None, limit=None, exclude=None):
         seen = set()
         unique = []
         for r in s.tool_results:
-            sig = (r.name, r.chars, r.is_error)
+            sig = (r.name, r.chars, r.is_error, r.target)
             if sig in seen:
                 continue
             seen.add(sig)

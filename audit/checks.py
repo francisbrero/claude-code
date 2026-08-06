@@ -337,6 +337,16 @@ def expensive_model_grunt_work(ctx):
     share = _pct(len(grunt), len(opus_calls))
     sev = "high" if savings > 50 else ("medium" if savings > 5 else "low")
 
+    # Attribute the waste to repos so the fix says where to apply it.
+    grunt_ids = {id(c) for c in grunt}
+    by_repo = defaultdict(float)
+    for s in ctx.sessions:
+        for c in s.calls:
+            if id(c) in grunt_ids:
+                by_repo[s.repo] += c.cost
+    top_repos = sorted(by_repo.items(), key=lambda kv: -kv[1])[:3]
+    repo_hint = ", ".join(f"`{r}` ({_money(v)})" for r, v in top_repos)
+
     return Finding(
         key="model_tiering",
         title="Premium model doing retrieval work",
@@ -357,19 +367,39 @@ def expensive_model_grunt_work(ctx):
             f"genuinely delegable retrieval, that is **{_money(savings)}** recoverable.\n\n"
             f"Median output on these calls: {statistics.median([c.output for c in grunt]):.0f} tokens."
         ),
-        table=[
-            ("Metric", "Value"),
-            ("Opus retrieval-shaped calls", f"{len(grunt):,}"),
-            ("Their cost on Opus", _money(grunt_cost)),
-            ("Same usage on Sonnet", _money(sonnet_cost)),
-            ("Median output tokens", f"{statistics.median([c.output for c in grunt]):.0f}"),
-        ],
+        table=(
+            [("Metric", "Value"),
+             ("Opus retrieval-shaped calls", f"{len(grunt):,}"),
+             ("Their cost on Opus", _money(grunt_cost)),
+             ("Same usage on Sonnet", _money(sonnet_cost)),
+             ("Median output tokens",
+              f"{statistics.median([c.output for c in grunt]):.0f}")]
+            + [("— in `%s`" % r, _money(v)) for r, v in top_repos]
+        ),
         fix=(
-            "Push the read-heavy phase into a subagent pinned to a cheap model, and let "
-            "the premium model judge only the distilled result. In a subagent definition, "
-            "set `model: haiku` (or `sonnet`) in the frontmatter; the Explore agent exists "
-            "for exactly this. Two-stage 'cheap model reads, expensive model decides' is "
-            "the single highest-leverage change for a read-heavy workload."
+            "Move the read-heavy phase onto a cheap model. Concretely:\n\n"
+            "**1. Create `~/.claude/agents/explore.md`** (this file does not exist yet if "
+            "the config check below flags it):\n\n"
+            "```markdown\n"
+            "---\n"
+            "name: explore\n"
+            "description: Read-heavy search and context gathering. Use for locating code, "
+            "reading files, and summarising findings.\n"
+            "model: haiku\n"
+            "tools: Read, Grep, Glob, Bash\n"
+            "---\n\n"
+            "Gather the requested context and return a concise summary with `file:line` "
+            "citations. Return findings, not file contents.\n"
+            "Do not read or enumerate `node_modules/`, `.next`, `dist`, `build`, "
+            "generated files, or `*.lock`.\n"
+            "```\n\n"
+            "**2. Route retrieval to it** — in a skill or prompt, delegate the "
+            "\"find/read/gather\" step to `explore` and keep only the decision on the "
+            "premium model.\n\n"
+            "**3. Set the default subagent model** so anything not explicitly pinned still "
+            "lands cheap: `CLAUDE_CODE_SUBAGENT_MODEL=haiku` in `~/.claude/settings.json` "
+            "under `env`.\n\n"
+            + (f"**Where it matters most:** {repo_hint}" if repo_hint else "")
         ),
     )
 
@@ -575,12 +605,20 @@ def session_hygiene(ctx):
     )
     savings = excess_reads * per_tok * CACHE_READ_MULT * 0.5
 
-    rows = [("Session", "Turns", "Peak context", "Cost")]
+    # Is a long session one sprawling catch-all, or a single long task? The
+    # answer changes the fix entirely: /clear helps the first and is useless
+    # advice for the second.
+    skill_driven = [s for s in heavy if s.skills_used]
+    skill_counts = Counter(k for s in heavy for k in s.skills_used)
+    task_shaped = _pct(len(skill_driven), len(heavy)) if heavy else 0
+
+    rows = [("Session", "Turns", "Peak context", "Driven by", "Cost")]
     for s in sorted(ctx.sessions, key=lambda s: -s.cost)[:8]:
         rows.append((
             (s.session_id or "?")[:8],
             f"{len(s.main_calls):,}",
             _tokens(s.peak_context()),
+            ", ".join(sorted(s.skills_used)[:2]) or "ad-hoc",
             _money(s.cost),
         ))
 
@@ -603,17 +641,47 @@ def session_hygiene(ctx):
             "individually (0.1x) but they are paid per turn, so they dominate long sessions.\n\n"
             f"{excess_reads and _tokens(excess_reads) or '0'} tokens were read above a "
             f"{_tokens(CEILING)} working ceiling across this window.\n\n"
-            f"Compaction events observed: {ctx.compactions}."
+            + (f"**{task_shaped:.0f}% of these long sessions run under a skill** — "
+               f"{', '.join(f'`{k}` ({n})' for k, n in skill_counts.most_common(3))}. "
+               "That means they are single long tasks rather than sessions left open, "
+               "so the fix is about keeping a task's context lean, not about clearing "
+               "more often.\n\n" if heavy and task_shaped >= 50 else "")
+            + f"Compaction events observed: {ctx.compactions}."
             + ("\n\nCompaction itself is not free — it re-reads the whole conversation to "
-               "summarise it. Clearing at a natural task boundary is cheaper than letting "
-               "auto-compact fire." if ctx.compactions else "")
+               "summarise it. Compacting deliberately at a task boundary is cheaper than "
+               "letting auto-compact fire at an arbitrary point."
+               if ctx.compactions else "")
         ),
         table=rows,
         fix=(
             "" if sev == "low" else
-            "`/clear` between unrelated tasks rather than letting one session sprawl. "
-            "Start a fresh session per issue/PR. If a session must run long, delegate the "
-            "bulky reading to subagents so the transcript stays small."
+            (
+                # A long session that is ONE task can't be /clear'd mid-flight.
+                # Recommending it anyway is the kind of advice that gets a report
+                # ignored, so give the remediation that actually applies.
+                f"These are long *tasks*, not sprawling sessions — {task_shaped:.0f}% of "
+                f"them run under a skill ({', '.join(k for k, _ in skill_counts.most_common(3))}), "
+                "so `/clear` mid-task is not available. What actually helps:\n\n"
+                "1. **Keep the bulk out of the transcript.** The context grows because "
+                "file reads and command output accumulate in the main thread. Route "
+                "exploration through subagents — their output never enters the parent "
+                "context, only their summary does. This is the single biggest lever on a "
+                "long task.\n"
+                "2. **Compact deliberately, not automatically.** Auto-compact fires late "
+                "and summarises everything at once. A skill-level checkpoint that writes "
+                "state to a dev-doc and compacts at a task boundary keeps the summary "
+                "small and relevant.\n"
+                "3. **Watch the dev-doc itself.** A dev-doc that accumulates history gets "
+                "re-read every session and becomes the bloat it was meant to prevent. "
+                "Keep a short 'current state' header at the top and let the agent read "
+                "only that; append detail below it.\n"
+                "4. **`/rewind` over `/compact`** where it fits — it truncates back to an "
+                "already-cached prefix instead of paying to build a new summary."
+                if task_shaped >= 50 else
+                "`/clear` between unrelated tasks rather than letting one session sprawl. "
+                "Start a fresh session per issue/PR. If a session must run long, delegate "
+                "the bulky reading to subagents so the transcript stays small."
+            )
         ),
     )
 
@@ -640,16 +708,75 @@ def tool_output_waste(ctx):
     per_tok = blended_input_price(ctx.calls)
     savings = est_tokens * avg_turns_after * per_tok * CACHE_READ_MULT * 0.5
 
-    by_tool = Counter()
+    # Group by what actually produced the bytes, because the remediation differs
+    # completely: an image needs a different fix than a 3000-line source file.
+    by_kind = defaultdict(int)
     for r in big:
-        by_tool[r.name] += r.chars
+        by_kind[r.kind] += r.chars
 
-    rows = [("Tool", "Oversized results", "Total chars")]
-    counts = Counter(r.name for r in big)
-    for name, chars in by_tool.most_common(6):
-        rows.append((name, f"{counts[name]:,}", f"{chars:,}"))
+    # Name the specific offenders. "You read too much" is not actionable;
+    # "this file, 12 times, 600K chars" is.
+    by_target = defaultdict(lambda: {"chars": 0, "n": 0, "repo": "", "kind": ""})
+    for r in big:
+        if not r.target:
+            continue
+        key = r.target
+        entry = by_target[key]
+        entry["chars"] += r.chars
+        entry["n"] += 1
+        entry["repo"] = r.repo or entry["repo"]
+        entry["kind"] = r.kind
+
+    ranked = sorted(by_target.items(), key=lambda kv: -kv[1]["chars"])[:12]
+    rows = [("Target", "Repo", "Reads", "Chars", "Type")]
+    for target, info in ranked:
+        shown = target if len(target) <= 58 else "…" + target[-55:]
+        rows.append((
+            "`" + shown + "`",
+            info["repo"] or "—",
+            f"{info['n']:,}",
+            f"{info['chars']:,}",
+            info["kind"],
+        ))
 
     errors = [r for r in results if r.is_error]
+
+    # Build a remediation list keyed to what was actually found, so each line is
+    # a change someone can make rather than general advice.
+    steps = []
+    if by_kind.get("image"):
+        n_img = sum(1 for r in big if r.kind == "image")
+        steps.append(
+            f"**Images ({n_img} reads, {by_kind['image'] / 1e6:.1f}M chars).** A screenshot "
+            "is one of the most expensive things to put in context and it never leaves. "
+            "Crop before reading, read it once in a subagent that reports back in text, "
+            "or point Playwright at an assertion instead of a screenshot."
+        )
+    if by_kind.get("instructions"):
+        steps.append(
+            f"**Skill / dev-doc files ({by_kind['instructions'] / 1e6:.1f}M chars).** These "
+            "are being re-read as ordinary files. Split the long ones so only the relevant "
+            "section loads, and keep dev-docs append-only with a short 'current state' "
+            "header the agent reads instead of the full history."
+        )
+    if by_kind.get("generated"):
+        steps.append(
+            f"**Generated / build output ({by_kind['generated'] / 1e6:.1f}M chars).** Add "
+            "these paths to the search skip-list in CLAUDE.md and to `.claude/settings.json` "
+            "deny rules so they are never read at all."
+        )
+    if by_kind.get("command"):
+        steps.append(
+            f"**Shell output ({by_kind['command'] / 1e6:.1f}M chars).** Pipe through "
+            "`head -100`, `wc -l`, or `--quiet`. `gh pr diff` and full test output are the "
+            "usual culprits — capture to a file and read the slice you need."
+        )
+    if by_kind.get("file"):
+        steps.append(
+            f"**Whole-file reads ({by_kind['file'] / 1e6:.1f}M chars).** Use `offset`/`limit`, "
+            "or grep for the symbol first and read only around the hit."
+        )
+
     sev = "high" if len(big) > len(results) * 0.05 else "medium"
 
     return Finding(
@@ -664,11 +791,14 @@ def tool_output_waste(ctx):
         ),
         detail=(
             "A tool result is not a one-off cost. Once it lands in the transcript it is "
-            "part of the context for every subsequent turn — an unbounded `grep`, a "
-            "`cat` of a generated file, or a full-file `Read` where 20 lines were needed "
-            "keeps billing long after it stopped being useful.\n\n"
+            "part of the context for every subsequent turn — so a single 600K-char read "
+            "keeps billing for the rest of the session.\n\n"
             f"Oversized results: **{len(big):,}** of {len(results):,} total "
             f"({_pct(len(big), len(results)):.1f}%), ~{_tokens(est_tokens)} tokens.\n\n"
+            "**This is usually not 'our source files are too big'.** The table below shows "
+            "what was actually read; in practice the bulk is images, generated output, and "
+            "unbounded shell commands rather than legitimate source. Check the `Type` "
+            "column before concluding the codebase is at fault.\n\n"
             f"Failed tool calls (which occupy context while contributing nothing): "
             f"**{len(errors):,}** ({_pct(len(errors), len(results)):.1f}%)."
             + ("\n\nA high error rate usually means retry loops — the same failing edit or "
@@ -676,11 +806,8 @@ def tool_output_waste(ctx):
                if _pct(len(errors), len(results)) > 10 else "")
         ),
         table=rows,
-        fix=(
-            "Read with `offset`/`limit` instead of whole files. Pipe shell output through "
-            "`head`/`wc -l`. Add build artifacts, `node_modules` and lockfiles to the "
-            "search skip-list. Push exploratory greps into a subagent so the raw output "
-            "never enters the main context."
+        fix=" ".join(f"({i}) {s}" for i, s in enumerate(steps, 1)) or (
+            "Read with `offset`/`limit`; pipe shell output through `head`."
         ),
     )
 
@@ -713,13 +840,17 @@ def runaway_context(ctx):
     savings = excess_cost * 0.7  # some long-context work is genuinely necessary
     off_cost = sum(s.cost for s in offenders)
 
-    rows = [("Session", "Directory", "Turns", "Peak context", "Cost")]
+    runaway_skills = Counter(k for s in offenders for k in s.skills_used)
+    skill_share = _pct(len([s for s in offenders if s.skills_used]), len(offenders))
+
+    rows = [("Session", "Repo", "Turns", "Peak context", "Driven by", "Cost")]
     for s in sorted(offenders, key=lambda s: -s.cost)[:10]:
         rows.append((
             (s.session_id or "?")[:8],
-            (s.cwd or "?").split("/")[-1],
+            s.repo,
             f"{len(s.main_calls):,}",
             _tokens(s.peak_context()),
+            ", ".join(sorted(s.skills_used)[:2]) or "ad-hoc",
             _money(s.cost),
         ))
 
@@ -751,11 +882,26 @@ def runaway_context(ctx):
         ),
         table=rows,
         fix=(
-            "Treat 200K as a hard ceiling. `/clear` at every task boundary — a new issue, "
-            "a new PR, a new bug — instead of continuing one session all day. Push file "
-            "reading into subagents so their output never enters the main transcript. "
-            "If work genuinely spans many hours, write findings to a scratch file and "
-            "start fresh rather than carrying the full history forward."
+            (
+                f"{skill_share:.0f}% of these are skill-driven single tasks "
+                f"({', '.join(k for k, _ in runaway_skills.most_common(3))}), so "
+                "'start a new session' is not the fix. Attack the growth rate instead:\n\n"
+                "1. **Delegate reading.** In these sessions the main thread does the "
+                "file reading itself. Every byte read stays in context for all remaining "
+                "turns. A subagent returns a summary and drops the raw bytes.\n"
+                "2. **Checkpoint to a dev-doc and compact at task boundaries** (after "
+                "planning, after implementation, before review) rather than letting "
+                "auto-compact fire at an arbitrary point.\n"
+                "3. **Cap what enters context**: `head` on shell output, `offset`/`limit` "
+                "on reads, and never read a screenshot into the main thread.\n"
+                "4. If a task genuinely needs 500+ turns, split it — the dev-doc carries "
+                "state across a fresh session far more cheaply than the transcript does."
+                if skill_share >= 50 else
+                "Treat 200K as a hard ceiling. `/clear` at every task boundary — a new "
+                "issue, a new PR, a new bug — instead of continuing one session all day. "
+                "Push file reading into subagents so their output never enters the main "
+                "transcript."
+            )
         ),
     )
 
