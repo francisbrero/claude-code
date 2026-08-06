@@ -7,6 +7,7 @@ Nothing here interprets the data — that's the checks' job. This module only
 normalises it.
 """
 
+import fnmatch
 import glob
 import json
 import os
@@ -75,6 +76,31 @@ class ToolResult:
     is_error: bool
 
 
+def repo_of(cwd):
+    """Best-effort repo name for a working directory.
+
+    Worktrees are collapsed onto their parent repo so that excluding a repo also
+    excludes its worktrees: `.../ottobot-worktrees/ottobot1` -> `ottobot`. Without
+    this, a user excluding a personal repo would still leak its worktrees.
+    """
+    if not cwd:
+        return "unknown"
+    parts = [p for p in cwd.rstrip("/").split("/") if p]
+    if not parts:
+        return "unknown"
+
+    for i, part in enumerate(parts):
+        # `<repo>-worktrees/<branch>` and `<repo>.worktrees/<branch>` layouts.
+        for marker in ("-worktrees", ".worktrees", "_worktrees"):
+            if part.endswith(marker):
+                return part[: -len(marker)]
+        # A plain `worktrees/` dir: the repo is the segment before it.
+        if part == "worktrees" and i > 0:
+            return parts[i - 1]
+
+    return parts[-1]
+
+
 @dataclass
 class Session:
     path: str
@@ -87,6 +113,10 @@ class Session:
     user_turns: int = 0
     compactions: int = 0
     skills_used: set = field(default_factory=set)
+
+    @property
+    def repo(self):
+        return repo_of(self.cwd)
 
     @property
     def cost(self):
@@ -257,7 +287,43 @@ def find_transcripts(root=None, since_days=None):
     return sorted(paths, key=os.path.getmtime, reverse=True)
 
 
-def load_sessions(root=None, since_days=None, limit=None):
+def is_excluded(session, patterns):
+    """True if this session matches any exclusion pattern.
+
+    A bare name matches the *repo* only — never an arbitrary path segment. That
+    distinction matters: a worktree can share a name with an unrelated repo
+    (`.../work-repo-worktrees/website` vs `.../website`), and excluding a
+    personal repo must not silently drop a work repo's worktree. Repo names
+    already fold worktrees into their parent, so `--exclude myrepo` still covers
+    every worktree of `myrepo`.
+
+    Patterns containing a slash or glob metacharacter are matched against the
+    full working directory instead, for "drop everything under this path".
+    """
+    if not patterns:
+        return False
+
+    cwd = (session.cwd or "").lower()
+    repo = (session.repo or "").lower()
+
+    for raw in patterns:
+        pat = raw.strip().lower().rstrip("/")
+        if not pat:
+            continue
+        if "/" in pat:
+            # Path-shaped: match the directory tree.
+            if fnmatch.fnmatch(cwd, pat) or fnmatch.fnmatch(cwd, pat + "/*"):
+                return True
+        elif any(ch in pat for ch in "*?["):
+            # Glob without a slash: a repo-name wildcard (`side-*`).
+            if fnmatch.fnmatch(repo, pat):
+                return True
+        elif pat == repo:
+            return True
+    return False
+
+
+def load_sessions(root=None, since_days=None, limit=None, exclude=None):
     """Load and deduplicate sessions.
 
     Claude Code forks a transcript into a new file whenever a session is
@@ -268,6 +334,11 @@ def load_sessions(root=None, since_days=None, limit=None):
     Billing happens once per `requestId`, so that is the unit of truth: keep the
     first occurrence of each request and drop the rest. Files sharing a
     sessionId are merged into one Session, since they are one conversation.
+
+    `exclude` is a list of glob/name patterns; matching sessions are dropped
+    before any analysis (see `is_excluded`).
+
+    Returns (sessions, excluded_count).
     """
     # File mtime only decides which files are worth opening. A resumed session
     # replays old history into a freshly-written file, so the real window filter
@@ -282,9 +353,14 @@ def load_sessions(root=None, since_days=None, limit=None):
 
     seen_requests = set()
     merged = {}
+    excluded_sessions = set()
     for p in paths:
         s = parse_session(p)
         if not s:
+            continue
+
+        if is_excluded(s, exclude):
+            excluded_sessions.add(s.session_id or p)
             continue
 
         fresh = []
@@ -326,4 +402,5 @@ def load_sessions(root=None, since_days=None, limit=None):
             unique.append(r)
         s.tool_results = unique
 
-    return [s for s in merged.values() if s.calls]
+    sessions = [s for s in merged.values() if s.calls]
+    return sessions, len(excluded_sessions)

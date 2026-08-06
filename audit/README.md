@@ -9,11 +9,48 @@ what is the shortest list of changes that actually reduces the bill?*
 ## Usage
 
 ```bash
-python3 cc_audit.py                 # last 30 days -> CC-AUDIT.md
+python3 cc_audit.py                 # ALL repos, last 30 days -> CC-AUDIT.md
 python3 cc_audit.py --days 7
 python3 cc_audit.py --out me.md
 python3 cc_audit.py --json          # machine-readable, for aggregating across a team
 ```
+
+## Excluding personal repos
+
+Every repo is analysed by default. To leave personal work out of a report you're
+going to share, first see what's there:
+
+```bash
+python3 cc_audit.py --list-repos
+```
+
+Then exclude by repo name, a repo-name glob, or a path:
+
+```bash
+python3 cc_audit.py --exclude side-project --exclude 'hobby-*'
+python3 cc_audit.py --exclude '/Users/me/personal/*'
+```
+
+To set it once instead of retyping, create `~/.claude/cc-audit.json`:
+
+```json
+{ "exclude": ["side-project", "/Users/me/personal/*"] }
+```
+
+Config and `--exclude` flags combine; `--no-config` ignores the file for one run.
+
+Matching rules, which are deliberately narrow to avoid dropping work by accident:
+
+- A **bare name** matches the repo only — never an arbitrary path segment. A
+  worktree can share a name with an unrelated repo (`work-repo-worktrees/website`
+  vs a standalone `website`), and excluding the latter must not silently drop the
+  former.
+- **Worktrees follow their parent repo**, so `--exclude myrepo` also excludes
+  every `myrepo-worktrees/*` checkout.
+- A pattern containing a **slash** matches the working directory tree.
+
+Exclusions are disclosed in the report and in the JSON output, so a reader can
+tell the figures are partial rather than assuming they cover everything.
 
 Python 3.9+, standard library only. No install, no dependencies, no network
 access — it reads `~/.claude/projects/**/*.jsonl` and writes one file. Nothing

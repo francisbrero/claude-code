@@ -23,7 +23,10 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from checks import _money, _tokens, build_findings  # noqa: E402
-from parse import load_sessions  # noqa: E402
+from parse import find_transcripts, load_sessions, parse_session, repo_of  # noqa: E402
+
+# Exclusions can live here so they don't have to be retyped on every run.
+CONFIG_PATH = os.path.expanduser("~/.claude/cc-audit.json")
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "ok": 3}
 SEVERITY_LABEL = {
@@ -44,10 +47,60 @@ class Context:
         self.total_cost = sum(c.cost for c in self.calls)
         self.compactions = sum(s.compactions for s in sessions)
         self.mcp_tool_count = settings.get("mcp_tool_count", 0)
+        self.exclude_patterns = []
+        self.excluded_files = 0
 
     def active_days(self):
         days = {s.start.date() for s in self.sessions if s.start}
         return len(days) or 1
+
+
+def load_exclude_config():
+    """Exclusion patterns from ~/.claude/cc-audit.json, if present.
+
+    Format: {"exclude": ["side-project", "/Users/me/personal/*"]}
+    """
+    if not os.path.exists(CONFIG_PATH):
+        return []
+    try:
+        with open(CONFIG_PATH) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"warning: could not read {CONFIG_PATH}: {exc}", file=sys.stderr)
+        return []
+    patterns = data.get("exclude") or []
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    return [str(p) for p in patterns]
+
+
+def list_repos(root, since_days):
+    """Print every repo found, so the user can decide what to exclude."""
+    totals = {}
+    for path in find_transcripts(root, since_days):
+        sess = parse_session(path)
+        if not sess:
+            continue
+        repo = repo_of(sess.cwd)
+        entry = totals.setdefault(repo, {"sessions": 0, "cwds": set()})
+        entry["sessions"] += 1
+        if sess.cwd:
+            entry["cwds"].add(sess.cwd)
+
+    if not totals:
+        print("No transcripts found.", file=sys.stderr)
+        return 1
+
+    print(f"\nRepos found in the last {since_days} days "
+          f"(pass any of these to --exclude):\n")
+    width = max(len(r) for r in totals)
+    for repo, info in sorted(totals.items(), key=lambda kv: -kv[1]["sessions"]):
+        wt = len(info["cwds"])
+        suffix = f"  ({wt} working dirs)" if wt > 1 else ""
+        print(f"  {repo:<{width}}  {info['sessions']:>4} transcript files{suffix}")
+    print(f"\nExclude permanently by creating {CONFIG_PATH}:")
+    print('  {"exclude": ["personal-repo", "/Users/you/side/*"]}\n')
+    return 0
 
 
 def load_settings():
@@ -218,8 +271,32 @@ def render(ctx, findings, days):
         out.append(md_table(rows) + "\n")
 
     # --- Spend breakdown ------------------------------------------------
+    if ctx.exclude_patterns:
+        out.append(
+            f"> **Scope:** {ctx.excluded_files} transcript file(s) excluded by "
+            f"`{'`, `'.join(ctx.exclude_patterns)}`. Every figure below is net of "
+            "those exclusions.\n"
+        )
+
     out.append("## Where the money goes\n")
     out.append(md_table(spend_overview(ctx)) + "\n")
+
+    by_repo = {}
+    for s in sessions:
+        entry = by_repo.setdefault(s.repo, {"cost": 0.0, "sessions": 0})
+        entry["cost"] += s.cost
+        entry["sessions"] += 1
+    if len(by_repo) > 1:
+        out.append("### By repo\n")
+        rows = [("Repo", "Sessions", "Cost", "Share")]
+        for repo, info in sorted(by_repo.items(), key=lambda kv: -kv[1]["cost"])[:12]:
+            rows.append((
+                repo,
+                f"{info['sessions']:,}",
+                _money(info["cost"]),
+                f"{100 * info['cost'] / ctx.total_cost:.1f}%" if ctx.total_cost else "—",
+            ))
+        out.append(md_table(rows) + "\n")
 
     top = sorted(sessions, key=lambda s: -s.cost)[:10]
     if top:
@@ -273,6 +350,8 @@ def to_json(ctx, findings, days):
     return {
         "generated": datetime.now().isoformat(timespec="seconds"),
         "window_days": days,
+        "excluded_patterns": ctx.exclude_patterns,
+        "excluded_files": ctx.excluded_files,
         "sessions": len(ctx.sessions),
         "api_calls": len(ctx.calls),
         "total_cost_usd": round(ctx.total_cost, 2),
@@ -308,18 +387,45 @@ def main():
                     help="transcript root (default: ~/.claude/projects)")
     ap.add_argument("--limit", type=int, default=None,
                     help="max sessions to analyse (for a quick look)")
+    ap.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                    help="repo name, path glob, or path segment to leave out "
+                         "(repeatable). Worktrees follow their parent repo.")
+    ap.add_argument("--no-config", action="store_true",
+                    help=f"ignore exclusions in {CONFIG_PATH}")
+    ap.add_argument("--list-repos", action="store_true",
+                    help="list the repos found, then exit (use to pick exclusions)")
     args = ap.parse_args()
 
+    if args.list_repos:
+        return list_repos(args.root, args.days)
+
+    # All repos are analysed by default; exclusions come from the config file
+    # and the command line combined.
+    exclude = list(args.exclude)
+    if not args.no_config:
+        exclude = load_exclude_config() + exclude
+
     print(f"Reading transcripts (last {args.days} days)…", file=sys.stderr)
-    sessions = load_sessions(root=args.root, since_days=args.days, limit=args.limit)
+    if exclude:
+        print(f"Excluding: {', '.join(exclude)}", file=sys.stderr)
+    sessions, excluded_count = load_sessions(
+        root=args.root, since_days=args.days, limit=args.limit, exclude=exclude,
+    )
     if not sessions:
-        print("No transcripts found. Is this the machine you run Claude Code on?",
-              file=sys.stderr)
+        if excluded_count:
+            print(f"Everything was excluded: {excluded_count} transcript file(s) "
+                  f"matched {', '.join(exclude)}. Loosen the exclusions "
+                  f"(or use --no-config) to get a report.", file=sys.stderr)
+        else:
+            print("No transcripts found. Is this the machine you run Claude Code on?",
+                  file=sys.stderr)
         return 1
 
     settings = load_settings()
     settings["mcp_tool_count"] = count_mcp_tools(sessions)
     ctx = Context(sessions, settings)
+    ctx.exclude_patterns = exclude
+    ctx.excluded_files = excluded_count
 
     print(f"Analysing {len(sessions):,} sessions / {len(ctx.calls):,} API calls…",
           file=sys.stderr)
