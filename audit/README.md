@@ -126,7 +126,26 @@ contains directory names and session IDs — review before circulating widely.
 | **Worktree fragmentation** | Cold cache starts multiplied across many working directories |
 | **Context bloat** | Baseline prefix size — CLAUDE.md, MCP tool schemas, system prompt |
 | **Tool output waste** | Oversized tool results that stay in context and are re-read every turn |
-| **Config switches** | No `~/.claude/agents/` (subagents inherit the expensive model), no-op `MAX_THINKING_TOKENS`, fallback chains, uncapped MCP output |
+| **Subagent model pinning** | Which subagents run on a premium model, agents pinned cheaper in one repo than another, and built-ins spawned with no override |
+| **Config switches** | No subagent definitions anywhere, no-op `MAX_THINKING_TOKENS`, fallback chains, uncapped MCP output |
+
+### Agent definitions are read at both levels
+
+Subagents can be defined in `~/.claude/agents/` **or** in a repo's
+`.claude/agents/`. The checks read both, and walk up from each working directory
+so a worktree resolves to whichever config applies to it.
+
+This matters: a check that only reads the user level will tell a team with a
+well-configured repo to "create an agents directory", which is wrong and gets
+the whole report dismissed. Built-in agents (`Explore`, `Plan`,
+`general-purpose`) have no definition file by design, so their absence is never
+reported as a misconfiguration — what's checked for those is whether spawns pass
+a cheap `model` override.
+
+The most useful signal here is **divergence**: when the same agent is pinned to
+Opus in one repo and Sonnet in another, one team has already decided the cheaper
+model does that job well enough, which makes the recommendation evidence-based
+rather than speculative.
 
 The report also benchmarks cost per active day against Anthropic's published
 figures (~$13/developer/active day; 90% of users under $30/active day), so the

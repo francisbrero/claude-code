@@ -22,6 +22,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import agents  # noqa: E402
 import store  # noqa: E402
 from checks import _money, _tokens, build_findings  # noqa: E402
 from parse import find_transcripts, load_sessions, parse_session, repo_of  # noqa: E402
@@ -50,6 +51,32 @@ class Context:
         self.mcp_tool_count = settings.get("mcp_tool_count", 0)
         self.exclude_patterns = []
         self.excluded_files = 0
+
+        # Subagent definitions, read at BOTH user and project level, plus how
+        # agents were actually spawned. Declared config and real behaviour can
+        # disagree, and the report should reflect what actually ran.
+        self.agent_defs = agents.discover({s.cwd for s in sessions})
+        self.spawn_stats = agents.spawn_stats(sessions)
+
+    @property
+    def has_cheap_explore(self):
+        """Is there a retrieval agent pinned to a cheap model, and used?
+
+        Either a definition named like an explorer pinned to haiku/sonnet, or
+        Explore spawns that pass a cheap `model` override.
+        """
+        for a in self.agent_defs:
+            if a.is_cheap and any(
+                w in a.name.lower() for w in ("explore", "search", "retriev", "read")
+            ):
+                return True
+        for kind, info in self.spawn_stats.items():
+            if "explore" not in kind.lower():
+                continue
+            for model, n in info["overrides"].items():
+                if n and ("haiku" in model or "sonnet" in model):
+                    return True
+        return False
 
     def active_days(self):
         days = {s.start.date() for s in self.sessions if s.start}

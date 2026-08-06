@@ -11,10 +11,19 @@ import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
+import agents
+import parse
 from pricing import (CACHE_READ_MULT, CACHE_WRITE_1H_MULT, CACHE_WRITE_5M_MULT,
                      FAMILY_TIER, prices_for)
 
 CHECKS = []
+
+# Agent types the harness provides. They have no file in .claude/agents/ by
+# design, so a missing definition is not a finding for these.
+BUILTIN_AGENTS = {
+    "Explore", "Plan", "general-purpose", "claude", "fork",
+    "statusline-setup", "claude-code-guide", "(default)",
+}
 
 
 def check(fn):
@@ -376,32 +385,49 @@ def expensive_model_grunt_work(ctx):
               f"{statistics.median([c.output for c in grunt]):.0f}")]
             + [("— in `%s`" % r, _money(v)) for r, v in top_repos]
         ),
-        fix=(
-            "Move the read-heavy phase onto a cheap model. Concretely:\n\n"
-            "**1. Create `~/.claude/agents/explore.md`** (this file does not exist yet if "
-            "the config check below flags it):\n\n"
+        fix=_tiering_fix(ctx, repo_hint),
+    )
+
+
+def _tiering_fix(ctx, repo_hint):
+    """Remediation text, matched to what is already configured.
+
+    Telling a team that already pins its retrieval agent to Haiku to "create an
+    explore agent" is wrong and gets the whole report dismissed. Only recommend
+    creating one when there genuinely isn't a cheap retrieval agent.
+    """
+    if ctx.has_cheap_explore:
+        head = (
+            "A cheap retrieval agent already exists and is being used, so the gap "
+            "is not the agent definition — it is how much reading still happens on "
+            "the main thread. Route more of the find/read/gather work through it, "
+            "and check whether the *reviewer* subagents are pinned to a premium "
+            "model (see the subagent-pinning finding).\n\n"
+        )
+    else:
+        head = (
+            "Move the read-heavy phase onto a cheap model.\n\n"
+            "**1. Create `~/.claude/agents/explore.md`**:\n\n"
             "```markdown\n"
             "---\n"
             "name: explore\n"
-            "description: Read-heavy search and context gathering. Use for locating code, "
-            "reading files, and summarising findings.\n"
+            "description: Read-heavy search and context gathering. Use for locating "
+            "code, reading files, and summarising findings.\n"
             "model: haiku\n"
             "tools: Read, Grep, Glob, Bash\n"
             "---\n\n"
-            "Gather the requested context and return a concise summary with `file:line` "
-            "citations. Return findings, not file contents.\n"
+            "Gather the requested context and return a concise summary with "
+            "`file:line` citations. Return findings, not file contents.\n"
             "Do not read or enumerate `node_modules/`, `.next`, `dist`, `build`, "
             "generated files, or `*.lock`.\n"
             "```\n\n"
-            "**2. Route retrieval to it** — in a skill or prompt, delegate the "
-            "\"find/read/gather\" step to `explore` and keep only the decision on the "
-            "premium model.\n\n"
-            "**3. Set the default subagent model** so anything not explicitly pinned still "
-            "lands cheap: `CLAUDE_CODE_SUBAGENT_MODEL=haiku` in `~/.claude/settings.json` "
-            "under `env`.\n\n"
-            + (f"**Where it matters most:** {repo_hint}" if repo_hint else "")
-        ),
-    )
+            "**2. Route retrieval to it** — delegate the \"find/read/gather\" step "
+            "and keep only the decision on the premium model.\n\n"
+            "**3. Set the default subagent model** so anything not explicitly "
+            "pinned still lands cheap: `CLAUDE_CODE_SUBAGENT_MODEL=haiku` in "
+            "`~/.claude/settings.json` under `env`.\n\n"
+        )
+    return head + (f"**Where it matters most:** {repo_hint}" if repo_hint else "")
 
 
 @check
@@ -907,6 +933,199 @@ def runaway_context(ctx):
 
 
 @check
+def subagent_model_pinning(ctx):
+    """Which subagents run on a premium model, and what that costs.
+
+    Reads agent definitions at BOTH the user and project level. A check that
+    only looks at ~/.claude/agents/ will tell a team with a well-configured repo
+    to "create an agents directory", which is wrong and gets the report ignored.
+    """
+    defs = ctx.agent_defs
+    stats = ctx.spawn_stats
+    if not defs and not stats:
+        return None
+
+    # Cost of sidechain work, split by model tier.
+    side = [c for c in ctx.calls if c.is_sidechain]
+    premium_cost = sum(c.cost for c in side if FAMILY_TIER.get(c.family, 3) > 2)
+    if not side:
+        return None
+
+    grouped = agents.by_name(defs)
+
+    # Premium-pinned agents that are spawned often enough to matter.
+    premium = []
+    for name, group in grouped.items():
+        models = {a.model for a in group if a.model}
+        if not any("opus" in m for m in models):
+            continue
+        spawns = stats.get(name, {}).get("spawns", 0)
+        premium.append((name, sorted(models), spawns, group))
+    premium.sort(key=lambda t: -t[2])
+
+    # The same agent pinned differently across repos: one repo has already
+    # decided the cheaper model is adequate for this exact job.
+    diverging = []
+    for name, group in grouped.items():
+        models = {a.model or "inherit" for a in group}
+        if len(models) > 1:
+            cheap = sorted(m for m in models if "haiku" in m or "sonnet" in m)
+            pricey = sorted(m for m in models if "opus" in m)
+            if cheap and pricey:
+                repos = {}
+                for a in group:
+                    # a.path is <repo>/.claude/agents/<name>.md — climb past
+                    # `.claude/agents` before deriving the repo name.
+                    root = os.path.dirname(os.path.dirname(os.path.dirname(a.path)))
+                    repos.setdefault(a.model or "inherit", set()).add(
+                        parse.repo_of(root))
+                diverging.append((name, cheap, pricey, repos))
+
+    # Spawned types with no definition anywhere -> they inherit the main model.
+    # Built-ins ship with the harness and have no user-authored file, so their
+    # absence from .claude/agents/ is normal, not a misconfiguration. What
+    # matters for those is whether spawns pass a cheap `model` override.
+    defined_names = set(grouped)
+    inheriting = []
+    for t, info in stats.items():
+        if t in defined_names or t in BUILTIN_AGENTS or info["spawns"] < 5:
+            continue
+        if "(no override)" not in info["overrides"]:
+            continue
+        inheriting.append((t, info["spawns"]))
+    inheriting.sort(key=lambda t: -t[1])
+
+    # Built-ins spawned on the main model with no override.
+    unpinned_builtins = []
+    for t, info in stats.items():
+        if t not in BUILTIN_AGENTS or t == "fork":
+            continue
+        bare = info["overrides"].get("(no override)", 0)
+        if bare >= 5:
+            unpinned_builtins.append((t, bare, info["spawns"]))
+    unpinned_builtins.sort(key=lambda t: -t[1])
+
+    if not premium and not diverging and not inheriting and not unpinned_builtins:
+        return None
+
+    # Savings: premium sidechain work re-priced one tier down. Reviewers are
+    # judgement work, so this is discounted more heavily than raw retrieval.
+    savings = premium_cost * 0.8 * 0.5
+
+    rows = [("Subagent", "Pinned model", "Spawns", "Scope")]
+    for name, models, spawns, group in premium[:8]:
+        rows.append((
+            f"`{name}`",
+            "/".join(models),
+            f"{spawns:,}" if spawns else "—",
+            group[0].scope,
+        ))
+    for name, spawns in inheriting[:5]:
+        rows.append((f"`{name}`", "_inherits main model_", f"{spawns:,}", "undefined"))
+    for name, bare, total in unpinned_builtins[:5]:
+        rows.append((
+            f"`{name}`",
+            f"_no override on {bare} of {total}_",
+            f"{total:,}",
+            "built-in",
+        ))
+
+    detail = [
+        f"Subagent calls cost **{_money(sum(c.cost for c in side))}**, of which "
+        f"**{_money(premium_cost)}** ran on a premium model.\n",
+        f"Agent definitions found: **{len(defs)}** "
+        f"({sum(1 for a in defs if a.scope == 'project')} project-level, "
+        f"{sum(1 for a in defs if a.scope == 'user')} user-level).\n",
+    ]
+
+    if diverging:
+        detail.append(
+            "**The same agent is pinned differently across repos.** One repo has "
+            "already decided a cheaper model does this exact job well enough:\n"
+        )
+        for name, cheap, pricey, repos in diverging[:4]:
+            cheap_repos = ", ".join(sorted(r for m in cheap for r in repos.get(m, [])))
+            pricey_repos = ", ".join(sorted(r for m in pricey for r in repos.get(m, [])))
+            detail.append(
+                f"- `{name}`: **{'/'.join(pricey)}** in {pricey_repos} — but "
+                f"**{'/'.join(cheap)}** in {cheap_repos}."
+            )
+        detail.append("")
+
+    if inheriting:
+        detail.append(
+            "**Spawned but never defined**, so these inherit the main "
+            "conversation's model: "
+            + ", ".join(f"`{n}` ({c} spawns)" for n, c in inheriting[:5]) + "\n"
+        )
+
+    if unpinned_builtins:
+        detail.append(
+            "**Built-in agents spawned without a `model` override**, so they run on "
+            "the main model: "
+            + ", ".join(f"`{n}` ({b} of {t} spawns)"
+                        for n, b, t in unpinned_builtins[:5])
+            + ". These need no definition file — pass `model` at spawn time, or set "
+              "a cheap default.\n"
+        )
+
+    # A reviewer that reads a large diff and emits a short verdict is mostly
+    # retrieval; the ratio makes that measurable rather than assumed.
+    ratio_note = ""
+    if side:
+        s_in = sum(c.total_input for c in side if FAMILY_TIER.get(c.family, 3) > 2)
+        s_out = sum(c.output for c in side if FAMILY_TIER.get(c.family, 3) > 2)
+        if s_out:
+            ratio_note = (
+                f"Premium subagent calls read **{_tokens(s_in)}** and wrote "
+                f"**{_tokens(s_out)}** — a **{s_in / s_out:.0f}:1** input/output ratio. "
+                "Most of that is reading a diff and gathering context, not judging it.\n"
+            )
+            detail.append(ratio_note)
+
+    fixes = []
+    if diverging:
+        fixes.append(
+            "Align the divergent agents on the cheaper model that another repo is "
+            "already using in production, then compare review quality on the next "
+            "few PRs before deciding it was wrong."
+        )
+    if premium:
+        fixes.append(
+            "For a reviewer, split the work rather than downgrading the verdict: a "
+            "cheap first stage reads the diff and gathers context, and the premium "
+            "model judges only that summary."
+        )
+    if inheriting:
+        fixes.append(
+            "Define the undefined agents (or pass `model:` at spawn) so they stop "
+            "inheriting the main model by default."
+        )
+    if unpinned_builtins:
+        fixes.append(
+            "Set `CLAUDE_CODE_SUBAGENT_MODEL=haiku` under `env` in "
+            "`~/.claude/settings.json` so built-in agents spawned without an "
+            "explicit override stop defaulting to the main model."
+        )
+
+    return Finding(
+        key="subagent_pinning",
+        title="Subagent model pinning",
+        severity="medium" if savings > 5 else "low",
+        savings=savings,
+        summary=(
+            f"{_money(premium_cost)} of subagent work runs on a premium model"
+            + (f"; {len(diverging)} agent(s) are pinned cheaper in another repo"
+               if diverging else "")
+            + "."
+        ),
+        detail="\n".join(detail),
+        table=rows,
+        fix=" ".join(fixes),
+    )
+
+
+@check
 def config_levers(ctx):
     """Settings-level switches that change cost but leave no trace in usage numbers."""
     issues = []
@@ -916,13 +1135,15 @@ def config_levers(ctx):
     for name in ("settings.json", "settings.local.json"):
         merged_env.update((settings.get(name) or {}).get("env") or {})
 
-    # 1. No custom subagent definitions => subagents inherit the main model.
-    #    Retrieval work then runs at premium prices by default.
-    if not settings.get("has_agents_dir"):
+    # 1. No subagent definitions anywhere — user level OR any project. Only
+    #    report this when both are genuinely absent: a repo with its own
+    #    .claude/agents/ is already configured, and telling that team to create
+    #    a user-level directory is wrong.
+    if not ctx.agent_defs:
         issues.append(
-            "**No `~/.claude/agents/` directory.** Subagents inherit the main model "
-            "instead of being pinned to a cheap one, so delegated retrieval costs the "
-            "same as doing it inline."
+            "**No subagent definitions found** at `~/.claude/agents/` or in any "
+            "repo's `.claude/agents/`. Subagents inherit the main model, so "
+            "delegated retrieval costs the same as doing it inline."
         )
         fixes.append(
             "Create `~/.claude/agents/explore.md` with `model: haiku` in the frontmatter "

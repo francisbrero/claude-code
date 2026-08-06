@@ -130,6 +130,15 @@ def repo_of(cwd):
 
 
 @dataclass
+class AgentSpawn:
+    """One `Agent` tool call: which subagent, and any per-call model override."""
+
+    subagent_type: str
+    model: str
+    repo: str = ""
+
+
+@dataclass
 class Session:
     path: str
     session_id: str = None
@@ -138,6 +147,8 @@ class Session:
     version: str = None
     calls: list = field(default_factory=list)
     tool_results: list = field(default_factory=list)
+    agent_spawns: list = field(default_factory=list)
+    _spawn_index: dict = field(default_factory=dict)  # tool_use_id -> AgentSpawn
     user_turns: int = 0
     compactions: int = 0
     skills_used: set = field(default_factory=set)
@@ -193,6 +204,7 @@ def parse_session(path):
     """Read one transcript file into a Session. Malformed lines are skipped."""
     s = Session(path=path)
     pending_targets = {}  # tool_use_id -> (tool name, target)
+    spawn_ids = {}        # tool_use_id -> AgentSpawn (deduped within the file)
     try:
         fh = open(path, errors="replace")
     except OSError:
@@ -254,6 +266,18 @@ def parse_session(path):
                         )
                         if p.get("id"):
                             pending_targets[p["id"]] = (p.get("name"), str(target))
+                        # Record how subagents are actually being spawned, so
+                        # declared config can be checked against real behaviour.
+                        if p.get("name") == "Agent":
+                            spawn = AgentSpawn(
+                                subagent_type=inp.get("subagent_type") or "",
+                                model=(inp.get("model") or "").strip().lower(),
+                                repo=repo_of(d.get("cwd") or s.cwd),
+                            )
+                            # Key on the tool_use id: two identical spawns are a
+                            # real pair, but the same id replayed across forked
+                            # transcript files is one event.
+                            spawn_ids[p.get("id") or id(spawn)] = spawn
                 model = msg.get("model") or "unknown"
                 if model == "<synthetic>":
                     continue  # not a billed call
@@ -302,6 +326,9 @@ def parse_session(path):
                         elif part.get("type") == "text":
                             s.user_turns += 1
 
+    # Keep ids and spawns as parallel ordered lists so merging can dedupe by id.
+    s._spawn_index = dict(spawn_ids)
+    s.agent_spawns = list(spawn_ids.values())
     return s if s.calls else None
 
 
@@ -430,6 +457,11 @@ def load_sessions(root=None, since_days=None, limit=None, exclude=None):
             # branch-specific results that exist in no other file. Dedupe on the
             # result's own identity instead, keeping the union.
             base.tool_results.extend(s.tool_results)
+            # Spawns are replayed across forked files; keep one per tool_use id.
+            for sid, sp in s._spawn_index.items():
+                if sid not in base._spawn_index:
+                    base._spawn_index[sid] = sp
+                    base.agent_spawns.append(sp)
             base.user_turns = max(base.user_turns, s.user_turns)
             base.compactions = max(base.compactions, s.compactions)
             base.skills_used |= s.skills_used
