@@ -1,0 +1,4 @@
+.DS_Store
+
+# Local Claude Code overrides — machine-specific, not shared
+.claude/settings.local.json
