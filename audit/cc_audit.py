@@ -22,6 +22,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import store  # noqa: E402
 from checks import _money, _tokens, build_findings  # noqa: E402
 from parse import find_transcripts, load_sessions, parse_session, repo_of  # noqa: E402
 
@@ -100,6 +101,55 @@ def list_repos(root, since_days):
         print(f"  {repo:<{width}}  {info['sessions']:>4} transcript files{suffix}")
     print(f"\nExclude permanently by creating {CONFIG_PATH}:")
     print('  {"exclude": ["personal-repo", "/Users/you/side/*"]}\n')
+    return 0
+
+
+def show_trend(root, uid):
+    """Print stored reports over time — the payoff for keeping a history."""
+    rows = store.history(root=root, uid=uid)
+    if not rows:
+        print(f"No stored reports yet under {root or store.DEFAULT_ROOT}.",
+              file=sys.stderr)
+        print("Run an audit first; each run saves one report per user per day.",
+              file=sys.stderr)
+        return 1
+
+    multi_user = len({r.get("user_id") for r in rows}) > 1
+    print(f"\nStored reports ({len(rows)}):\n")
+    header = f"  {'Date':<12} {'User':<18} {'Spend':>10} {'/day':>9} {'Save':>10} {'Hit%':>6}"
+    if not multi_user:
+        header = f"  {'Date':<12} {'Spend':>10} {'/day':>9} {'Save':>10} {'Hit%':>6}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    for r in rows:
+        m = r.get("metrics") or {}
+        per_day = m.get("cost_per_active_day_usd")
+        hit = m.get("cache_hit_rate_pct")
+        cells = [
+            f"{r.get('date', '?'):<12}",
+            f"{_money(r.get('total_cost_usd') or 0):>10}",
+            f"{_money(per_day):>9}" if per_day else f"{'—':>9}",
+            f"{_money(r.get('estimated_savings_usd') or 0):>10}",
+            f"{hit:>6.1f}" if hit else f"{'—':>6}",
+        ]
+        if multi_user:
+            cells.insert(1, f"{r.get('user_id', '?'):<18}")
+        print("  " + " ".join(cells))
+
+    # Which findings recur? That is the cross-run learning this store exists for.
+    tally = {}
+    for r in rows:
+        for f in r.get("findings", []):
+            key = f.get("title") or f.get("key")
+            entry = tally.setdefault(key, {"n": 0, "savings": 0.0})
+            entry["n"] += 1
+            entry["savings"] += f.get("savings_usd") or 0
+    if tally:
+        print("\n  Most common findings across these reports:\n")
+        for title, info in sorted(tally.items(), key=lambda kv: -kv[1]["savings"])[:8]:
+            print(f"    {info['n']:>3}x  {_money(info['savings']):>10}  {title}")
+    print()
     return 0
 
 
@@ -349,6 +399,7 @@ def render(ctx, findings, days):
 def to_json(ctx, findings, days):
     return {
         "generated": datetime.now().isoformat(timespec="seconds"),
+        "user_id": store.user_id(),
         "window_days": days,
         "excluded_patterns": ctx.exclude_patterns,
         "excluded_files": ctx.excluded_files,
@@ -394,7 +445,19 @@ def main():
                     help=f"ignore exclusions in {CONFIG_PATH}")
     ap.add_argument("--list-repos", action="store_true",
                     help="list the repos found, then exit (use to pick exclusions)")
+    ap.add_argument("--report-dir", default=None, metavar="DIR",
+                    help=f"where to store dated reports (default: {store.DEFAULT_ROOT})")
+    ap.add_argument("--no-store", action="store_true",
+                    help="don't save a dated copy of this report")
+    ap.add_argument("--trend", action="store_true",
+                    help="show stored reports over time, then exit")
+    ap.add_argument("--all-users", action="store_true",
+                    help="with --trend, include every user under the report dir")
     args = ap.parse_args()
+
+    if args.trend:
+        return show_trend(args.report_dir,
+                          None if args.all_users else store.user_id())
 
     if args.list_repos:
         return list_repos(args.root, args.days)
@@ -435,13 +498,28 @@ def main():
     with open(args.out, "w") as fh:
         fh.write(report)
 
+    payload = to_json(ctx, findings, args.days)
+
+    stored = None
+    if not args.no_store:
+        try:
+            stored = store.save(report, payload, ctx, root=args.report_dir)
+        except OSError as exc:
+            print(f"warning: could not store report: {exc}", file=sys.stderr)
+
     savings = sum(f.savings for f in findings)
     print(f"\n  Spend analysed:  {_money(ctx.total_cost)}", file=sys.stderr)
     print(f"  Recoverable:     {_money(savings)}", file=sys.stderr)
-    print(f"  Report:          {args.out}\n", file=sys.stderr)
+    print(f"  Report:          {args.out}", file=sys.stderr)
+    if stored:
+        md_path, json_path = stored
+        print(f"  Stored:          {md_path}", file=sys.stderr)
+        print(f"                   {os.path.basename(json_path)} (sanitized, "
+              f"safe to share)", file=sys.stderr)
+    print("", file=sys.stderr)
 
     if args.json:
-        print(json.dumps(to_json(ctx, findings, args.days), indent=2))
+        print(json.dumps(payload, indent=2))
     return 0
 
 

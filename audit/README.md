@@ -15,6 +15,49 @@ python3 cc_audit.py --out me.md
 python3 cc_audit.py --json          # machine-readable, for aggregating across a team
 ```
 
+## Stored reports
+
+Every run saves a dated copy under `~/.claude/cc-audit-reports/<user-id>/`, so
+learnings accumulate as more people run it:
+
+```text
+~/.claude/cc-audit-reports/
+  francis-b73b/
+    2026-08-05.md      full report — paths, commands, session IDs
+    2026-08-05.json    sanitized metrics — safe to pool
+    latest.md -> 2026-08-05.md
+```
+
+The user ID is `<os-username>-<4-char machine hash>`; the hash distinguishes two
+laptops without embedding a hostname. One report per user per day — re-running
+overwrites that day.
+
+**The two files exist for different audiences.** The markdown is for the person
+who ran it and keeps every detail that made a finding actionable. The JSON is
+what you collect centrally, and it carries **no file paths, no shell commands,
+no repo names, and no free text** — summaries and fixes are dropped precisely
+because they quote real paths. Pooling the JSON cannot leak anyone's work.
+
+```bash
+python3 cc_audit.py --trend              # your reports over time
+python3 cc_audit.py --trend --all-users  # everyone under the report dir
+python3 cc_audit.py --no-store           # don't save this run
+python3 cc_audit.py --report-dir /shared/audits   # collect somewhere central
+```
+
+`--trend` also tallies which findings recur across reports, which is the point
+of keeping a history: it shows whether a fix actually moved the number, and
+which problems are common enough to be worth solving org-wide rather than
+one engineer at a time.
+
+To gather reports centrally, have people point `--report-dir` at a synced
+folder, or collect the `*.json` files — they are designed to be concatenated:
+
+```python
+import store
+rows = store.history(root="/shared/audits")   # every user, oldest first
+```
+
 ## Excluding personal repos
 
 Every repo is analysed by default. To leave personal work out of a report you're
