@@ -2,3 +2,6 @@
 
 # Local Claude Code overrides — machine-specific, not shared
 .claude/settings.local.json
+CC-AUDIT.md
+__pycache__/
+*.pyc
