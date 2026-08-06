@@ -108,7 +108,7 @@ def repo_of(cwd):
     """Best-effort repo name for a working directory.
 
     Worktrees are collapsed onto their parent repo so that excluding a repo also
-    excludes its worktrees: `.../ottobot-worktrees/ottobot1` -> `ottobot`. Without
+    excludes its worktrees: `.../myrepo-worktrees/feature1` -> `myrepo`. Without
     this, a user excluding a personal repo would still leak its worktrees.
     """
     if not cwd:

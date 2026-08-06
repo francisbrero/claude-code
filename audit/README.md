@@ -22,10 +22,10 @@ learnings accumulate as more people run it:
 
 ```text
 ~/.claude/cc-audit-reports/
-  francis-b73b/
-    2026-08-05.md      full report — paths, commands, session IDs
-    2026-08-05.json    sanitized metrics — safe to pool
-    latest.md -> 2026-08-05.md
+  alice-b73b/
+    2026-01-15.md      full report — paths, commands, session IDs
+    2026-01-15.json    sanitized metrics — safe to pool
+    latest.md -> 2026-01-15.md
 ```
 
 The user ID is `<os-username>-<4-char machine hash>`; the hash distinguishes two
