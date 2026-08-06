@@ -81,12 +81,35 @@ class ToolResult:
     is_error: bool
     target: str = ""
     repo: str = ""
+    error_text: str = ""   # first line of the error, for classification
 
     IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
 
     @property
     def is_image(self):
         return self.target.lower().endswith(self.IMAGE_EXT)
+
+    @property
+    def error_kind(self):
+        """Classify a failure by cause, since each has a different fix."""
+        if not self.is_error:
+            return ""
+        t = (self.error_text or "").lower()
+        if "has not been read yet" in t:
+            return "edit_before_read"
+        if "string to replace not found" in t or "not unique" in t:
+            return "stale_edit"
+        if "does not exist" in t or "no such file" in t or "eisdir" in t:
+            return "bad_path"
+        if "permission" in t or "denied" in t or "not allowed" in t:
+            return "permission_denied"
+        if "exit code 127" in t or "command not found" in t:
+            return "missing_command"
+        if "timed out" in t or "timeout" in t:
+            return "timeout"
+        if "exit code" in t:
+            return "shell_failure"
+        return "other"
 
     @property
     def kind(self):
@@ -322,6 +345,10 @@ def parse_session(path):
                                 is_error=bool(part.get("is_error")),
                                 target=target,
                                 repo=repo_of(d.get("cwd") or s.cwd),
+                                error_text=(
+                                    _result_text(part)[:200]
+                                    if part.get("is_error") else ""
+                                ),
                             ))
                         elif part.get("type") == "text":
                             s.user_turns += 1
@@ -474,7 +501,7 @@ def load_sessions(root=None, since_days=None, limit=None, exclude=None):
         seen = set()
         unique = []
         for r in s.tool_results:
-            sig = (r.name, r.chars, r.is_error, r.target)
+            sig = (r.name, r.chars, r.is_error, r.target, r.error_text)
             if sig in seen:
                 continue
             seen.add(sig)

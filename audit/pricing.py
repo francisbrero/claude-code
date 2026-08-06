@@ -13,16 +13,51 @@ CACHE_WRITE_1H_MULT = 2.00
 CACHE_READ_MULT = 0.10
 
 # family -> (input $/Mtok, output $/Mtok)
+#
+# Verified against the published Claude API pricing table. Opus 5 / 4.8 / 4.7 /
+# 4.6 are all $5/$25 — NOT the $15/$75 of the Claude 3 Opus era. Getting this
+# wrong overstates every figure in the report by 3x, so re-verify before
+# editing rather than reasoning from memory.
 FAMILY_PRICES = {
-    "opus": (15.0, 75.0),
+    "opus": (5.0, 25.0),
     "sonnet": (3.0, 15.0),
     "haiku": (1.0, 5.0),
-    "fable": (3.0, 15.0),
+    "fable": (10.0, 50.0),
 }
 
 # Relative capability tier. Used to decide whether a cheaper model could
 # plausibly have done the work.
 FAMILY_TIER = {"haiku": 1, "fable": 2, "sonnet": 2, "opus": 3}
+
+
+# Per-family sanity bounds on the INPUT price. These are deliberately tight:
+# the realistic failure is a stale figure from an older generation, and a wide
+# range would wave it through. Claude 3 Opus was $15/Mtok; current Opus is $5,
+# so an upper bound of 20 catches nothing. 8 catches it.
+#
+# The failure mode is silent — every report still renders, just 3x wrong — so
+# this raises at import rather than warning.
+_SANE_INPUT_RANGE = {
+    "opus": (2.0, 8.0),
+    "sonnet": (1.0, 5.0),
+    "haiku": (0.2, 2.0),
+    "fable": (5.0, 15.0),
+}
+
+for _fam, (_in, _out) in FAMILY_PRICES.items():
+    _lo, _hi = _SANE_INPUT_RANGE.get(_fam, (0.1, 50.0))
+    if not (_lo <= _in <= _hi):
+        raise ValueError(
+            f"{_fam} input price ${_in}/Mtok is outside the expected "
+            f"${_lo}-${_hi} range — verify against published pricing before "
+            "changing this, and widen the bound deliberately if a real price "
+            "moved outside it."
+        )
+    if not (3.0 <= _out / _in <= 7.0):
+        raise ValueError(
+            f"{_fam} output/input ratio is {_out / _in:.1f}x; Claude models "
+            "price output at ~5x input, so one of these is likely stale."
+        )
 
 
 def family_of(model: str) -> str:

@@ -933,6 +933,112 @@ def runaway_context(ctx):
 
 
 @check
+def failed_tool_calls(ctx):
+    """Failed tool calls cost a full turn and teach the model nothing.
+
+    Every failure bills the whole context to produce an error, then bills it
+    again for the retry. Unlike most waste this one is fixable at the source:
+    the common failures have specific, addressable causes.
+    """
+    results = [r for s in ctx.sessions for r in s.tool_results]
+    if not results:
+        return None
+
+    errors = [r for r in results if r.is_error]
+    if len(errors) < 10:
+        return None
+
+    rate = _pct(len(errors), len(results))
+
+    # A failed call costs roughly one main-thread turn: the context is sent,
+    # an error comes back, and the work still has to be redone.
+    main = [c for s in ctx.sessions for c in s.main_calls]
+    avg_turn = statistics.mean([c.cost for c in main]) if main else 0
+    savings = len(errors) * avg_turn * 0.6  # some failures are unavoidable probing
+
+    buckets = Counter(r.error_kind for r in errors)
+
+    rows = [("Failure", "Count", "Share")]
+    for kind, n in buckets.most_common(8):
+        rows.append((ERROR_LABEL.get(kind, kind), f"{n:,}", f"{_pct(n, len(errors)):.0f}%"))
+
+    # Sessions where failures are concentrated are the ones worth looking at.
+    worst = []
+    for s in ctx.sessions:
+        if len(s.tool_results) < 40:
+            continue
+        errs = sum(1 for r in s.tool_results if r.is_error)
+        if errs:
+            worst.append((_pct(errs, len(s.tool_results)), errs, s))
+    worst.sort(key=lambda t: -t[0])
+
+    steps = []
+    if buckets.get("edit_before_read"):
+        steps.append(
+            f"**Edit-before-read ({buckets['edit_before_read']}).** The model tried to "
+            "edit a file it hadn't opened. Usually means a skill or prompt tells it to "
+            "edit a path directly — have that step read first, or pass the content."
+        )
+    if buckets.get("stale_edit"):
+        steps.append(
+            f"**Stale edit ({buckets['stale_edit']}).** The target string had already "
+            "changed. Common after a formatter or a parallel edit; re-read before "
+            "editing rather than reusing a remembered snippet."
+        )
+    if buckets.get("bad_path"):
+        steps.append(
+            f"**Bad path ({buckets['bad_path']}).** Files referenced that don't exist — "
+            "usually a wrong working directory in a worktree, or a path from CLAUDE.md "
+            "that has moved. Check the paths your instructions name still resolve."
+        )
+    if buckets.get("shell_failure"):
+        steps.append(
+            f"**Shell failures ({buckets['shell_failure']}).** Commands exiting non-zero. "
+            "Worth checking whether a recurring one (a test runner, a lint step) is "
+            "failing predictably and could be fixed or removed from the loop."
+        )
+    if buckets.get("timeout"):
+        steps.append(
+            f"**Timeouts ({buckets['timeout']}).** These bill the full context and return "
+            "nothing. Raise the timeout for known-slow commands or run them in the "
+            "background."
+        )
+    if buckets.get("permission_denied"):
+        steps.append(
+            f"**Permission denials ({buckets['permission_denied']}).** Each denial costs a "
+            "turn. Add the safe, frequent commands to the allow-list in "
+            "`.claude/settings.json`."
+        )
+
+    sev = "high" if rate > 5 else ("medium" if rate > 2 else "low")
+    return Finding(
+        key="failed_tools",
+        title="Failed tool calls and retry loops",
+        severity=sev,
+        savings=savings,
+        summary=(
+            f"{len(errors):,} of {len(results):,} tool calls failed ({rate:.1f}%), "
+            f"costing roughly {_money(savings)} in turns that produced nothing."
+        ),
+        detail=(
+            "A failed tool call is billed like any other turn: the whole context goes "
+            "up, an error comes back, and the work still has to be done. The retry "
+            "then pays for the same context again.\n\n"
+            f"At an average of {_money(avg_turn)} per main-thread turn, "
+            f"{len(errors):,} failures is about {_money(len(errors) * avg_turn)} of "
+            "spend before accounting for the retries. The estimate above discounts "
+            "that, since some failures are legitimate probing.\n\n"
+            "Unlike most waste in this report, these have specific causes you can fix "
+            "at the source rather than habits to change."
+        ),
+        table=rows,
+        fix=" ".join(f"({i}) {s}" for i, s in enumerate(steps, 1)) or (
+            "Review the most common failures above and address their causes."
+        ),
+    )
+
+
+@check
 def subagent_model_pinning(ctx):
     """Which subagents run on a premium model, and what that costs.
 
