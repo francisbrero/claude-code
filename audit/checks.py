@@ -8,6 +8,7 @@ number nobody will act on.
 
 import os
 import statistics
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
@@ -17,6 +18,18 @@ from pricing import (CACHE_READ_MULT, CACHE_WRITE_1H_MULT, CACHE_WRITE_5M_MULT,
                      FAMILY_TIER, prices_for)
 
 CHECKS = []
+
+# Human-readable labels for the failure buckets in `failed_tool_calls`.
+ERROR_LABEL = {
+    "edit_before_read": "Edit before read",
+    "stale_edit": "Stale edit (target text changed)",
+    "bad_path": "File or path not found",
+    "permission_denied": "Permission denied",
+    "missing_command": "Command not found",
+    "timeout": "Timed out",
+    "shell_failure": "Shell command failed",
+    "other": "Other",
+}
 
 # Agent types the harness provides. They have no file in .claude/agents/ by
 # design, so a missing definition is not a finding for these.
@@ -1389,9 +1402,18 @@ def build_findings(ctx):
         try:
             f = fn(ctx)
         except Exception as exc:  # a broken check must not kill the report
+            # Surface it loudly. A crashed check previously rendered as a
+            # low-severity row at the bottom of the roadmap, which reads like a
+            # finding worth ignoring rather than a bug — one shipped that way.
+            print(f"warning: check `{fn.__name__}` crashed: {exc}", file=sys.stderr)
             f = Finding(
-                key=fn.__name__, title=fn.__name__, severity="low", savings=0.0,
-                summary=f"check failed: {exc}",
+                key=fn.__name__,
+                title=f"⚠️ Check `{fn.__name__}` failed to run",
+                severity="high", savings=0.0,
+                summary=(
+                    f"This check crashed (`{exc}`), so its findings are missing "
+                    "from this report. The other findings are unaffected."
+                ),
             )
         if f:
             out.append(f)

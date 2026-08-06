@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agents  # noqa: E402
 import critic  # noqa: E402
 import evidence  # noqa: E402
+import grade as grade_mod  # noqa: E402
 import store  # noqa: E402
 from checks import _money, _tokens, build_findings  # noqa: E402
 from parse import find_transcripts, load_sessions, parse_session, repo_of  # noqa: E402
@@ -59,6 +60,9 @@ class Context:
         # disagree, and the report should reflect what actually ran.
         self.agent_defs = agents.discover({s.cwd for s in sessions})
         self.spawn_stats = agents.spawn_stats(sessions)
+
+        # Waste as a share of this setup's own spend (see grade.py).
+        self.grade = grade_mod.compute(self)
 
     @property
     def has_cheap_explore(self):
@@ -145,9 +149,9 @@ def show_trend(root, uid):
 
     multi_user = len({r.get("user_id") for r in rows}) > 1
     print(f"\nStored reports ({len(rows)}):\n")
-    header = f"  {'Date':<12} {'User':<18} {'Spend':>10} {'/day':>9} {'Save':>10} {'Hit%':>6}"
+    header = f"  {'Date':<12} {'User':<18} {'Spend':>10} {'Waste':>10} {'Grade':>6}"
     if not multi_user:
-        header = f"  {'Date':<12} {'Spend':>10} {'/day':>9} {'Save':>10} {'Hit%':>6}"
+        header = f"  {'Date':<12} {'Spend':>10} {'Waste':>10} {'Grade':>6}"
     print(header)
     print("  " + "-" * (len(header) - 2))
 
@@ -155,12 +159,13 @@ def show_trend(root, uid):
         m = r.get("metrics") or {}
         per_day = m.get("cost_per_active_day_usd")
         hit = m.get("cache_hit_rate_pct")
+        waste = r.get("waste_usd")
+        pct = r.get("waste_pct")
         cells = [
             f"{r.get('date', '?'):<12}",
             f"{_money(r.get('total_cost_usd') or 0):>10}",
-            f"{_money(per_day):>9}" if per_day else f"{'—':>9}",
-            f"{_money(r.get('estimated_savings_usd') or 0):>10}",
-            f"{hit:>6.1f}" if hit else f"{'—':>6}",
+            (f"{_money(waste)} ({pct:.0f}%)".rjust(10) if waste else f"{'—':>10}"),
+            f"{(r.get('grade') or '—'):>6}",
         ]
         if multi_user:
             cells.insert(1, f"{r.get('user_id', '?'):<18}")
@@ -302,32 +307,35 @@ def render(ctx, findings, days, verdicts=None):
     else:
         out.append("No material savings identified — this setup looks efficient.\n")
 
-    # Benchmark against Anthropic's published per-developer averages, so the
-    # headline number is interpretable rather than just large.
+    # The grade measures waste as a share of THIS setup's own spend. Spend per
+    # day is reported as context, never as a benchmark: a developer doing more
+    # valuable work spends more, and that is not a defect to correct.
     active = ctx.active_days()
     per_day = ctx.total_cost / active
-    BENCH_DAY = 13.0        # published average $/developer/active day
-    BENCH_HEAVY = 30.0      # published: 90% of users are under this per active day
-    if per_day > BENCH_HEAVY:
-        band = (
-            f"That is **{per_day / BENCH_DAY:.0f}x the published average** of ~${BENCH_DAY:.0f}"
-            f"/developer/active day, and above the ~${BENCH_HEAVY:.0f}/day mark that 90% of "
-            "users stay under. There is real headroom here."
+    g = ctx.grade
+    if g:
+        out.append(f"## Efficiency grade: {g['grade']}\n")
+        out.append(f"**{g['verdict']}**\n")
+        out.append(
+            f"Of the {_money(g['total_usd'])} spent, about **{_money(g['waste_usd'])} "
+            f"({g['waste_pct']:.0f}%)** bought nothing — it paid for context re-read "
+            "without adding information, work run on a pricier model than it needed, "
+            f"or calls that failed. The other {_money(g['efficient_usd'])} is the cost "
+            "of the work itself.\n"
         )
-    elif per_day > BENCH_DAY:
-        band = (
-            f"That is above the published ~${BENCH_DAY:.0f}/developer/active day average "
-            f"but within the normal range (90% of users are under ${BENCH_HEAVY:.0f}/day)."
+        rows = [("Wasted on", "Cost", "Share of spend")]
+        for comp in g["components"]:
+            rows.append((
+                comp["label"],
+                _money(comp["cost"]),
+                f"{100 * comp['cost'] / g['total_usd']:.1f}%",
+            ))
+        out.append(md_table(rows) + "\n")
+        out.append(
+            "_This grade is scored against your own spend, not against other "
+            "developers. Spending more because you are doing more is not waste; "
+            "these components are._\n"
         )
-    else:
-        band = (
-            f"That is at or below the published ~${BENCH_DAY:.0f}/developer/active day "
-            "average — this setup is already economical."
-        )
-    out.append(
-        f"Across **{active} active days**, that is **{_money(per_day)}/active day**. "
-        f"{band}\n"
-    )
 
     out.append(md_table([
         ("Metric", "Value"),
@@ -461,6 +469,9 @@ def to_json(ctx, findings, days):
     return {
         "generated": datetime.now().isoformat(timespec="seconds"),
         "user_id": store.user_id(),
+        "grade": (ctx.grade or {}).get("grade"),
+        "waste_usd": round((ctx.grade or {}).get("waste_usd", 0.0), 2),
+        "waste_pct": round((ctx.grade or {}).get("waste_pct", 0.0), 1),
         "window_days": days,
         "excluded_patterns": ctx.exclude_patterns,
         "excluded_files": ctx.excluded_files,
