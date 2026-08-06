@@ -701,11 +701,11 @@ def session_hygiene(ctx):
                 f"These are long *tasks*, not sprawling sessions — {task_shaped:.0f}% of "
                 f"them run under a skill ({', '.join(k for k, _ in skill_counts.most_common(3))}), "
                 "so `/clear` mid-task is not available. What actually helps:\n\n"
-                "1. **Keep the bulk out of the transcript.** The context grows because "
-                "file reads and command output accumulate in the main thread. Route "
-                "exploration through subagents — their output never enters the parent "
-                "context, only their summary does. This is the single biggest lever on a "
-                "long task.\n"
+                "1. **Cap what enters the transcript.** The context grows because file "
+                "reads and command output accumulate in the main thread. See the "
+                "\"What your context is made of\" finding for this setup's actual "
+                "split — it says which sources to cap, and whether delegating more "
+                "would help or is already saturated.\n"
                 "2. **Compact deliberately, not automatically.** Auto-compact fires late "
                 "and summarises everything at once. A skill-level checkpoint that writes "
                 "state to a dev-doc and compacts at a task boundary keeps the summary "
@@ -852,6 +852,152 @@ def tool_output_waste(ctx):
 
 
 @check
+def context_composition(ctx):
+    """What the main-thread context is actually MADE of.
+
+    Everyone's advice for long sessions is "delegate to subagents". That only
+    helps if subagent results are where the context is going. Measuring the
+    composition first tells you whether the standard advice applies to this
+    setup or targets a rounding error.
+
+    Main thread only: a subagent's own reads never enter the parent context,
+    so counting them would credit delegation with bloat it actually prevented.
+    """
+    results = [
+        r for s in ctx.sessions for r in s.tool_results
+        if not r.is_error and not r.is_sidechain
+    ]
+    if len(results) < 100:
+        return None
+
+    by_tool = defaultdict(lambda: {"chars": 0, "calls": 0, "sizes": []})
+    for r in results:
+        name = r.name or "other"
+        entry = by_tool[name]
+        entry["chars"] += r.chars
+        entry["calls"] += 1
+        entry["sizes"].append(r.chars)
+
+    total = sum(e["chars"] for e in by_tool.values())
+    if not total:
+        return None
+
+    ranked = sorted(by_tool.items(), key=lambda kv: -kv[1]["chars"])
+
+    rows = [("Source", "Share", "Chars", "Calls", "Median", "Largest")]
+    for name, e in ranked[:8]:
+        sizes = sorted(e["sizes"])
+        rows.append((
+            f"`{name}`",
+            f"{_pct(e['chars'], total):.1f}%",
+            f"{e['chars'] / 1e6:.1f}M",
+            f"{e['calls']:,}",
+            f"{sizes[len(sizes) // 2]:,}",
+            f"{sizes[-1]:,}",
+        ))
+
+    # Growth rate: how fast does a long session approach the ceiling?
+    rates = []
+    for s in ctx.sessions:
+        mains = sorted((c for c in s.main_calls if c.ts), key=lambda c: c.ts)
+        if len(mains) < 20:
+            continue
+        rates.append((mains[-1].total_input - mains[0].total_input) / len(mains))
+    growth = statistics.median(rates) if rates else 0
+    turns_to_ceiling = int((200_000 - 30_000) / growth) if growth > 0 else 0
+
+    # Is delegation already saturated? Agent results are the only part of the
+    # main-thread context that delegating MORE can remove.
+    agent_share = _pct(by_tool.get("Agent", {}).get("chars", 0), total)
+
+    # Per-source remediation, keyed to the shape of each source's distribution.
+    # A concentrated source (few huge results) and a diffuse one (thousands of
+    # small ones) need different fixes, so classify before advising.
+    steps = []
+    for name, e in ranked[:4]:
+        share = _pct(e["chars"], total)
+        if share < 8:
+            continue
+        sizes = sorted(e["sizes"])
+        median = sizes[len(sizes) // 2]
+        top1 = sum(sizes[-max(1, len(sizes) // 100):])
+        concentrated = _pct(top1, e["chars"]) > 40
+
+        if name == "Bash":
+            steps.append(
+                f"**`Bash` — {share:.0f}%** ({e['calls']:,} calls, median "
+                f"{median:,} chars). "
+                + ("A few huge outputs dominate; cap those specific commands."
+                   if concentrated else
+                   "No dominant offender — this is thousands of ordinary "
+                   "results accumulating. Capping output has to become a habit "
+                   "in your skills (`| head -100`, `--quiet`, `wc -l`, or "
+                   "redirect to a file and read back a slice), not a one-time "
+                   "cleanup of outliers.")
+            )
+        elif name == "Read":
+            steps.append(
+                f"**`Read` — {share:.0f}%** ({e['calls']:,} calls, median "
+                f"{median:,} chars, largest {sizes[-1]:,}). Use `offset`/`limit`, "
+                "or grep for the symbol first and read only around the hit."
+                + ("  The top 1% of reads are most of this — those files are "
+                   "the place to start." if concentrated else "")
+            )
+        elif name == "Agent":
+            steps.append(
+                f"**`Agent` — {share:.0f}%** ({e['calls']:,} spawns, median "
+                f"{median:,} chars returned). Subagent summaries are already "
+                "compact; this is not where the context is going."
+            )
+        else:
+            steps.append(
+                f"**`{name}` — {share:.0f}%** ({e['calls']:,} calls, median "
+                f"{median:,} chars). Worth a look if this is unexpected."
+            )
+
+    detail = [
+        "Long sessions are usually treated as a discipline problem. They are "
+        "really an accumulation problem, and accumulation has a specific "
+        "composition worth measuring before acting on generic advice.\n",
+        f"Main-thread tool results total **{total / 1e6:.0f}M characters** "
+        f"(~{total / 4 / 1e6:.1f}M tokens) across {len(results):,} calls. "
+        "Subagent-internal results are excluded: they never enter the parent "
+        "context, which is the point of delegating.\n",
+    ]
+    if growth:
+        detail.append(
+            f"Median context growth: **{growth:,.0f} tokens per turn** — from a "
+            f"typical baseline that reaches the 200K window at roughly "
+            f"**turn {turns_to_ceiling}**.\n"
+        )
+
+    if agent_share < 15:
+        detail.append(
+            f"**Delegating more will not fix this.** Subagent returns are only "
+            f"**{agent_share:.1f}%** of main-thread context, so even perfect "
+            "delegation leaves the rest untouched. The standard 'use subagents' "
+            "advice is already saturated here — the top sources below are what "
+            "actually need capping.\n"
+        )
+
+    top_two = _pct(sum(e["chars"] for _, e in ranked[:2]), total)
+    return Finding(
+        key="context_composition",
+        title="What your context is made of",
+        severity="medium",
+        savings=0.0,  # diagnostic: the cost is already counted by other checks
+        summary=(
+            f"`{ranked[0][0]}` and `{ranked[1][0]}` are {top_two:.0f}% of "
+            f"everything accumulating in the main thread"
+            + (f"; context grows {growth:,.0f} tokens/turn." if growth else ".")
+        ),
+        detail="\n".join(detail),
+        table=rows,
+        fix=" ".join(f"({i}) {s}" for i, s in enumerate(steps, 1)),
+    )
+
+
+@check
 def runaway_context(ctx):
     """Sessions that blow past the standard 200K window into long-context territory.
 
@@ -925,9 +1071,11 @@ def runaway_context(ctx):
                 f"{skill_share:.0f}% of these are skill-driven single tasks "
                 f"({', '.join(k for k, _ in runaway_skills.most_common(3))}), so "
                 "'start a new session' is not the fix. Attack the growth rate instead:\n\n"
-                "1. **Delegate reading.** In these sessions the main thread does the "
-                "file reading itself. Every byte read stays in context for all remaining "
-                "turns. A subagent returns a summary and drops the raw bytes.\n"
+                "1. **Cap the biggest sources.** Every byte a tool returns stays in "
+                "context for all remaining turns. The \"What your context is made of\" "
+                "finding measures which tools those actually are here — delegation only "
+                "helps if subagent returns are a large share, which is often not the "
+                "case.\n"
                 "2. **Checkpoint to a dev-doc and compact at task boundaries** (after "
                 "planning, after implementation, before review) rather than letting "
                 "auto-compact fire at an arbitrary point.\n"

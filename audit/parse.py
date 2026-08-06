@@ -81,6 +81,7 @@ class ToolResult:
     is_error: bool
     target: str = ""
     repo: str = ""
+    is_sidechain: bool = False
     error_text: str = ""   # first line of the error, for classification
 
     IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
@@ -343,6 +344,10 @@ def parse_session(path):
                                 name=tool_name or _tool_name_for(d),
                                 chars=len(_result_text(part)),
                                 is_error=bool(part.get("is_error")),
+                                # A subagent's own tool results never enter the
+                                # parent's context — counting them would credit
+                                # delegation with bloat it actually prevented.
+                                is_sidechain=bool(d.get("isSidechain")),
                                 target=target,
                                 repo=repo_of(d.get("cwd") or s.cwd),
                                 error_text=(
@@ -501,7 +506,7 @@ def load_sessions(root=None, since_days=None, limit=None, exclude=None):
         seen = set()
         unique = []
         for r in s.tool_results:
-            sig = (r.name, r.chars, r.is_error, r.target, r.error_text)
+            sig = (r.name, r.chars, r.is_error, r.target, r.error_text, r.is_sidechain)
             if sig in seen:
                 continue
             seen.add(sig)
