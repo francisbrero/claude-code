@@ -46,6 +46,11 @@ contains directory names and session IDs — review before circulating widely.
 | **Worktree fragmentation** | Cold cache starts multiplied across many working directories |
 | **Context bloat** | Baseline prefix size — CLAUDE.md, MCP tool schemas, system prompt |
 | **Tool output waste** | Oversized tool results that stay in context and are re-read every turn |
+| **Config switches** | No `~/.claude/agents/` (subagents inherit the expensive model), no-op `MAX_THINKING_TOKENS`, fallback chains, uncapped MCP output |
+
+The report also benchmarks cost per active day against Anthropic's published
+figures (~$13/developer/active day; 90% of users under $30/active day), so the
+headline number is interpretable rather than merely large.
 
 ## How the cost model works
 

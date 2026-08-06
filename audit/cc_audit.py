@@ -45,6 +45,10 @@ class Context:
         self.compactions = sum(s.compactions for s in sessions)
         self.mcp_tool_count = settings.get("mcp_tool_count", 0)
 
+    def active_days(self):
+        days = {s.start.date() for s in self.sessions if s.start}
+        return len(days) or 1
+
 
 def load_settings():
     """Read local config for signals the transcripts don't carry."""
@@ -73,6 +77,10 @@ def load_settings():
                 pass
             break
     out["mcp_servers"] = sorted(servers)
+    # Custom subagent definitions are the only way to pin a subagent to a cheap
+    # model; without them, subagents inherit the main (expensive) model.
+    agents_dir = os.path.join(home, "agents")
+    out["has_agents_dir"] = os.path.isdir(agents_dir) and bool(os.listdir(agents_dir))
     return out
 
 
@@ -162,9 +170,38 @@ def render(ctx, findings, days):
     else:
         out.append("No material savings identified — this setup looks efficient.\n")
 
+    # Benchmark against Anthropic's published per-developer averages, so the
+    # headline number is interpretable rather than just large.
+    active = ctx.active_days()
+    per_day = ctx.total_cost / active
+    BENCH_DAY = 13.0        # published average $/developer/active day
+    BENCH_HEAVY = 30.0      # published: 90% of users are under this per active day
+    if per_day > BENCH_HEAVY:
+        band = (
+            f"That is **{per_day / BENCH_DAY:.0f}x the published average** of ~${BENCH_DAY:.0f}"
+            f"/developer/active day, and above the ~${BENCH_HEAVY:.0f}/day mark that 90% of "
+            "users stay under. There is real headroom here."
+        )
+    elif per_day > BENCH_DAY:
+        band = (
+            f"That is above the published ~${BENCH_DAY:.0f}/developer/active day average "
+            f"but within the normal range (90% of users are under ${BENCH_HEAVY:.0f}/day)."
+        )
+    else:
+        band = (
+            f"That is at or below the published ~${BENCH_DAY:.0f}/developer/active day "
+            "average — this setup is already economical."
+        )
+    out.append(
+        f"Across **{active} active days**, that is **{_money(per_day)}/active day**. "
+        f"{band}\n"
+    )
+
     out.append(md_table([
         ("Metric", "Value"),
         ("Sessions", f"{len(sessions):,}"),
+        ("Active days", f"{active:,}"),
+        ("Cost per active day", _money(per_day)),
         ("API calls", f"{len(calls):,}"),
         ("Total input tokens", _tokens(sum(c.total_input for c in calls))),
         ("Total output tokens", _tokens(sum(c.output for c in calls))),

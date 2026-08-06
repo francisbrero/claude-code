@@ -731,6 +731,89 @@ def runaway_context(ctx):
     )
 
 
+@check
+def config_levers(ctx):
+    """Settings-level switches that change cost but leave no trace in usage numbers."""
+    issues = []
+    fixes = []
+    settings = ctx.settings
+    merged_env = {}
+    for name in ("settings.json", "settings.local.json"):
+        merged_env.update((settings.get(name) or {}).get("env") or {})
+
+    # 1. No custom subagent definitions => subagents inherit the main model.
+    #    Retrieval work then runs at premium prices by default.
+    if not settings.get("has_agents_dir"):
+        issues.append(
+            "**No `~/.claude/agents/` directory.** Subagents inherit the main model "
+            "instead of being pinned to a cheap one, so delegated retrieval costs the "
+            "same as doing it inline."
+        )
+        fixes.append(
+            "Create `~/.claude/agents/explore.md` with `model: haiku` in the frontmatter "
+            "so read-heavy delegation actually lands on a cheap model."
+        )
+
+    # 2. MAX_THINKING_TOKENS is ignored by adaptive-reasoning models. Setting it
+    #    and assuming thinking is capped is false confidence, not a cap.
+    mtt = merged_env.get("MAX_THINKING_TOKENS")
+    if mtt and str(mtt) != "0":
+        issues.append(
+            f"**`MAX_THINKING_TOKENS={mtt}` is not doing what it looks like.** "
+            "Adaptive-reasoning models ignore nonzero thinking budgets — only `0` "
+            "reliably disables thinking. This setting is very likely a no-op."
+        )
+        fixes.append(
+            "Use effort levels to control reasoning cost on adaptive models; set "
+            "`MAX_THINKING_TOKENS=0` only if you genuinely want thinking off."
+        )
+
+    # 3. A fallback chain can silently land on a pricier model.
+    fb = None
+    for name in ("settings.json", "settings.local.json"):
+        fb = fb or (settings.get(name) or {}).get("fallbackModel")
+    if fb:
+        issues.append(
+            f"**`fallbackModel` is set to `{fb}`.** Fallbacks fire on overload without "
+            "announcing themselves; if the chain lands on a pricier model the extra "
+            "spend is invisible."
+        )
+        fixes.append("Confirm every model in the fallback chain is one you want to pay for.")
+
+    # 4. MCP output cap. Default is 25,000 tokens per tool result, which is a lot
+    #    of context for one call to inject.
+    cap = merged_env.get("MAX_MCP_OUTPUT_TOKENS")
+    if ctx.mcp_tool_count and not cap:
+        issues.append(
+            f"**{ctx.mcp_tool_count} MCP tools in use with no `MAX_MCP_OUTPUT_TOKENS` cap.** "
+            "The default allows up to 25,000 tokens per tool result, and whatever lands "
+            "there stays in context for the rest of the session."
+        )
+        fixes.append(
+            "Set `MAX_MCP_OUTPUT_TOKENS` to something like 5000 unless a server genuinely "
+            "needs to return more."
+        )
+
+    if not issues:
+        return None
+
+    return Finding(
+        key="config_levers",
+        title="Configuration switches worth changing",
+        severity="medium",
+        savings=0.0,  # real but not separately attributable; avoid double-counting
+        summary=f"{len(issues)} configuration issue(s) that affect cost but don't show up in token counts.",
+        detail=(
+            "These are settings-level findings. They have no separate dollar estimate "
+            "because their cost is already counted in the findings above — but they are "
+            "often the *mechanism* behind those numbers, and the cheapest things to change.\n\n"
+            + "\n\n".join(f"- {i}" for i in issues)
+        ),
+        table=[],
+        fix=" ".join(fixes),
+    )
+
+
 def build_findings(ctx):
     out = []
     for fn in CHECKS:
