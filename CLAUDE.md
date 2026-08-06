@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding assistants working in this repository.
+It is the single source of truth: `AGENTS.md` (Codex) and `GEMINI.md` (Gemini CLI)
+are symlinks to this file, so edit only this one.
 
 ## Repository Purpose
 
@@ -10,9 +12,30 @@ This repo is **public**. Do not name the private source repo, its internal URLs,
 
 ## Key Files
 
-- **setup.md** - Per-repo Claude Code configuration (hooks, skills, slash commands, dev docs, review loops)
-- **laptop-setup.md** - One-time machine setup (worktrees, keyboard shortcuts)
+- **setup.md** - Per-repo Claude Code configuration (hooks, skills, slash commands, subagents, dev docs, review loops)
+- **laptop-setup.md** - One-time machine setup (worktrees, status line, usage monitoring, keyboard shortcuts)
 - **README.md** - Public-facing description of the repository
+
+## This Repo's Own Configuration
+
+The repo eats its own dog food, scoped to what a docs-only project can use:
+
+```text
+CLAUDE.md              # single source of truth
+AGENTS.md -> CLAUDE.md # symlink (Codex CLI)
+GEMINI.md -> CLAUDE.md # symlink (Gemini CLI)
+.claude/
+  settings.json        # permissions allow-list (committed)
+  commands/create-pr.md
+```
+
+Deliberately absent: skills, `skill-rules.json`, and the hook suite. There's no
+build, no test suite, and no dependencies here, so build-checkers and test gates
+would be dead weight. Don't add them just because setup.md documents them —
+setup.md describes what a *product* repo needs.
+
+If you add a new instruction file for another assistant, symlink it to
+`CLAUDE.md` rather than copying. Duplicated instruction files drift.
 
 ## Git Workflow
 
