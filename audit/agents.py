@@ -65,6 +65,18 @@ class AgentDef:
     def is_premium(self):
         return "opus" in self.model
 
+    @property
+    def delegates_externally(self):
+        """Does this agent shell out to an external CLI as its primary path?
+
+        A Codex-primary reviewer that falls back to Opus is not "pinned to
+        Opus" in any meaningful sense: on the happy path the model does almost
+        no generation, and the pin only sets the fallback tier. Recommending a
+        downgrade there is wrong — it changes the fallback, not the reviewer.
+        """
+        text = f"{self.description}".lower()
+        return any(w in text for w in ("codex", "external agent", "gemini", "falls back"))
+
     def __repr__(self):
         return f"<AgentDef {self.name} scope={self.scope} model={self.model or 'inherit'}>"
 

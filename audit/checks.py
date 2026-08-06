@@ -947,26 +947,49 @@ def subagent_model_pinning(ctx):
 
     # Cost of sidechain work, split by model tier.
     side = [c for c in ctx.calls if c.is_sidechain]
-    premium_cost = sum(c.cost for c in side if FAMILY_TIER.get(c.family, 3) > 2)
+    premium_calls = [c for c in side if FAMILY_TIER.get(c.family, 3) > 2]
+    premium_cost = sum(c.cost for c in premium_calls)
     if not side:
         return None
 
+    # A premium call that emits almost nothing is a wrapper turn — orchestration
+    # around an external tool, not generation. Downgrading the model does not
+    # remove that cost, because the cost is the re-read context, not the output.
+    WRAPPER_OUT = 5
+    wrapper = [c for c in premium_calls if c.output <= WRAPPER_OUT]
+    substantive = [c for c in premium_calls if c.output > WRAPPER_OUT]
+    wrapper_cost = sum(c.cost for c in wrapper)
+    substantive_cost = sum(c.cost for c in substantive)
+
     grouped = agents.by_name(defs)
 
-    # Premium-pinned agents that are spawned often enough to matter.
+    # Premium-pinned agents that are spawned often enough to matter. Agents that
+    # delegate to an external CLI are tracked separately: their pin sets the
+    # fallback tier, so "use a cheaper model" is the wrong recommendation.
     premium = []
+    external = []
     for name, group in grouped.items():
         models = {a.model for a in group if a.model}
         if not any("opus" in m for m in models):
             continue
         spawns = stats.get(name, {}).get("spawns", 0)
-        premium.append((name, sorted(models), spawns, group))
+        row = (name, sorted(models), spawns, group)
+        if any(a.delegates_externally for a in group):
+            external.append(row)
+        else:
+            premium.append(row)
     premium.sort(key=lambda t: -t[2])
+    external.sort(key=lambda t: -t[2])
 
     # The same agent pinned differently across repos: one repo has already
     # decided the cheaper model is adequate for this exact job.
     diverging = []
     for name, group in grouped.items():
+        # An external-delegating agent's model is its fallback tier. Two repos
+        # choosing different fallbacks is not evidence that the cheaper one is
+        # adequate for the primary path.
+        if any(a.delegates_externally for a in group):
+            continue
         models = {a.model or "inherit" for a in group}
         if len(models) > 1:
             cheap = sorted(m for m in models if "haiku" in m or "sonnet" in m)
@@ -1008,11 +1031,20 @@ def subagent_model_pinning(ctx):
     if not premium and not diverging and not inheriting and not unpinned_builtins:
         return None
 
-    # Savings: premium sidechain work re-priced one tier down. Reviewers are
-    # judgement work, so this is discounted more heavily than raw retrieval.
-    savings = premium_cost * 0.8 * 0.5
+    # Savings come only from SUBSTANTIVE premium generation re-priced one tier
+    # down. Wrapper turns are excluded: their cost is re-read context, which a
+    # cheaper model would still pay. Discounted further because reviewing is
+    # judgement work where a downgrade carries real quality risk.
+    savings = substantive_cost * 0.8 * 0.5
 
-    rows = [("Subagent", "Pinned model", "Spawns", "Scope")]
+    rows = [("Subagent", "Pinned model", "Spawns", "Note")]
+    for name, models, spawns, group in external[:6]:
+        rows.append((
+            f"`{name}`",
+            "/".join(models),
+            f"{spawns:,}" if spawns else "—",
+            "external-primary (pin = fallback)",
+        ))
     for name, models, spawns, group in premium[:8]:
         rows.append((
             f"`{name}`",
@@ -1036,7 +1068,29 @@ def subagent_model_pinning(ctx):
         f"Agent definitions found: **{len(defs)}** "
         f"({sum(1 for a in defs if a.scope == 'project')} project-level, "
         f"{sum(1 for a in defs if a.scope == 'user')} user-level).\n",
+        "**Most premium subagent spend is not generation.** Splitting those calls "
+        f"by what they actually emitted:\n\n"
+        f"- **{len(wrapper):,} wrapper turns** (≤{WRAPPER_OUT} output tokens) — "
+        f"{_money(wrapper_cost)}. These are orchestration steps: deciding what to "
+        "run, shelling out, reading a result. The cost is the context re-read on "
+        "each turn, **not** the model's output — so moving them to a cheaper model "
+        "saves proportionally less than the headline suggests, and fewer/larger "
+        "turns saves more than a downgrade would.\n"
+        f"- **{len(substantive):,} substantive turns** (>{WRAPPER_OUT} output "
+        f"tokens) — {_money(substantive_cost)}. This is the only part where the "
+        "model tier is really the lever, and it is what the saving below is "
+        "based on.\n",
     ]
+
+    if external:
+        detail.append(
+            "**Externally-delegating agents are excluded from the recommendation.** "
+            + ", ".join(f"`{n}`" for n, _, _, _ in external[:4])
+            + " shell out to an external CLI on the primary path and only use the "
+            "pinned model as a fallback. Their `model:` line sets the *fallback* "
+            "tier, so changing it does not change what normally runs — and would "
+            "quietly downgrade the safety net.\n"
+        )
 
     if diverging:
         detail.append(
@@ -1071,30 +1125,41 @@ def subagent_model_pinning(ctx):
 
     # A reviewer that reads a large diff and emits a short verdict is mostly
     # retrieval; the ratio makes that measurable rather than assumed.
-    ratio_note = ""
-    if side:
-        s_in = sum(c.total_input for c in side if FAMILY_TIER.get(c.family, 3) > 2)
-        s_out = sum(c.output for c in side if FAMILY_TIER.get(c.family, 3) > 2)
+    # The overall input:output ratio is dominated by wrapper turns, so quoting it
+    # as evidence of "retrieval on an expensive model" would overstate the case.
+    # Report the ratio for substantive turns only.
+    if substantive:
+        s_in = sum(c.total_input for c in substantive)
+        s_out = sum(c.output for c in substantive)
         if s_out:
-            ratio_note = (
-                f"Premium subagent calls read **{_tokens(s_in)}** and wrote "
-                f"**{_tokens(s_out)}** — a **{s_in / s_out:.0f}:1** input/output ratio. "
-                "Most of that is reading a diff and gathering context, not judging it.\n"
+            detail.append(
+                f"Across the substantive turns alone the ratio is "
+                f"**{s_in / s_out:.0f}:1** ({_tokens(s_in)} read vs "
+                f"{_tokens(s_out)} written). A high ratio here means the model is "
+                "still ingesting a lot to produce a little — worth splitting into a "
+                "cheap gather stage and a premium verdict stage.\n"
             )
-            detail.append(ratio_note)
 
     fixes = []
+    if wrapper_cost > substantive_cost:
+        fixes.append(
+            f"Most of this ({_money(wrapper_cost)}) is wrapper turns, so the lever is "
+            "**turn count, not model tier**: each orchestration step re-reads the "
+            "whole subagent context to emit a few tokens. Batch the shell steps "
+            "(probe, write prompt, invoke, read result) into fewer calls and the "
+            "cost falls without touching the model."
+        )
     if diverging:
         fixes.append(
             "Align the divergent agents on the cheaper model that another repo is "
             "already using in production, then compare review quality on the next "
             "few PRs before deciding it was wrong."
         )
-    if premium:
+    if premium and substantive_cost > 20:
         fixes.append(
-            "For a reviewer, split the work rather than downgrading the verdict: a "
-            "cheap first stage reads the diff and gathers context, and the premium "
-            "model judges only that summary."
+            "For the agents that genuinely generate on a premium model, split the "
+            "work rather than downgrading the verdict: a cheap first stage gathers "
+            "context, and the premium model judges only that summary."
         )
     if inheriting:
         fixes.append(
@@ -1114,7 +1179,9 @@ def subagent_model_pinning(ctx):
         severity="medium" if savings > 5 else "low",
         savings=savings,
         summary=(
-            f"{_money(premium_cost)} of subagent work runs on a premium model"
+            f"{_money(premium_cost)} of subagent work runs on a premium model, but "
+            f"only {_money(substantive_cost)} of it is actual generation — "
+            f"{_money(wrapper_cost)} is wrapper turns whose cost is re-read context"
             + (f"; {len(diverging)} agent(s) are pinned cheaper in another repo"
                if diverging else "")
             + "."
