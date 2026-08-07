@@ -69,6 +69,10 @@ def sanitize(payload, ctx=None):
         "api_calls": payload.get("api_calls"),
         "total_cost_usd": payload.get("total_cost_usd"),
         "estimated_savings_usd": payload.get("estimated_savings_usd"),
+        # Efficiency grade: waste as a share of this setup's own spend.
+        "grade": payload.get("grade"),
+        "waste_usd": payload.get("waste_usd"),
+        "waste_pct": payload.get("waste_pct"),
         "input_tokens": payload.get("input_tokens"),
         "output_tokens": payload.get("output_tokens"),
         # How many patterns were excluded, never which ones (they are paths).

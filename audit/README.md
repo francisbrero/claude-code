@@ -15,6 +15,58 @@ python3 cc_audit.py --out me.md
 python3 cc_audit.py --json          # machine-readable, for aggregating across a team
 ```
 
+## Challenging the recommendations (`--challenge`)
+
+The analysis is deterministic: fixed thresholds, no model, no network. That makes
+the numbers auditable, but it also means a recommendation can assert something
+about your setup that is simply false — "create an explore agent" when you have
+forty, or "pin this reviewer to Sonnet" when that pin is a Codex fallback tier.
+
+`--challenge` sends the findings to an LLM whose only job is to **attack** them:
+
+```bash
+python3 cc_audit.py --days 30 --challenge
+python3 cc_audit.py --show-packet          # see exactly what would be sent
+```
+
+When a recommendation is overturned, the corrected one **silently replaces** it.
+The report never shows both — a finding that says "do X" and then "actually do Y"
+just makes the reader adjudicate a disagreement they have no way to settle. You
+get one instruction per finding, either way.
+
+The only thing the pass adds to the report is a **"Don't double-count these"**
+section listing findings that are one problem seen at different granularities,
+so their savings aren't summed.
+
+**The critic never computes or adjusts a number.** The deterministic pass owns
+all arithmetic; the critic only rules on whether a recommendation is supported.
+That boundary is what keeps the figures reproducible.
+
+### What gets sent — config, never conversation
+
+The packet is **~4K tokens of configuration and counters**. It is built from
+structured fields only, so transcripts cannot leak into it by construction:
+
+| Sent | Never sent |
+|---|---|
+| Agent names, scopes, pinned models, descriptions | Prompts, replies, thinking |
+| How agents were spawned, and with what override | Tool results, file contents, diffs |
+| Settings/env var **names** (values redacted) | File paths, shell commands, URLs |
+| Token counts, costs, ratios, severities | Repo names, session IDs |
+
+Agent *descriptions* are included deliberately — that is where "this reviewer
+uses Codex first" is written, and without it the critic cannot tell a pricing
+choice from a fallback tier.
+
+A regex guard scans the machine-derived fields before anything is sent and
+**aborts the run** if a path, source filename, URL, or shell command appears.
+Use `--show-packet` to inspect the payload yourself; it prints and exits without
+contacting anything.
+
+Runs through the already-authenticated `claude` CLI, so there is no API key to
+manage. If the CLI is missing or fails, the run warns and the deterministic
+report is written unchanged.
+
 ## Stored reports
 
 Every run saves a dated copy under `~/.claude/cc-audit-reports/<user-id>/`, so
@@ -126,7 +178,26 @@ contains directory names and session IDs — review before circulating widely.
 | **Worktree fragmentation** | Cold cache starts multiplied across many working directories |
 | **Context bloat** | Baseline prefix size — CLAUDE.md, MCP tool schemas, system prompt |
 | **Tool output waste** | Oversized tool results that stay in context and are re-read every turn |
-| **Config switches** | No `~/.claude/agents/` (subagents inherit the expensive model), no-op `MAX_THINKING_TOKENS`, fallback chains, uncapped MCP output |
+| **Subagent model pinning** | Which subagents run on a premium model, agents pinned cheaper in one repo than another, and built-ins spawned with no override |
+| **Config switches** | No subagent definitions anywhere, no-op `MAX_THINKING_TOKENS`, fallback chains, uncapped MCP output |
+
+### Agent definitions are read at both levels
+
+Subagents can be defined in `~/.claude/agents/` **or** in a repo's
+`.claude/agents/`. The checks read both, and walk up from each working directory
+so a worktree resolves to whichever config applies to it.
+
+This matters: a check that only reads the user level will tell a team with a
+well-configured repo to "create an agents directory", which is wrong and gets
+the whole report dismissed. Built-in agents (`Explore`, `Plan`,
+`general-purpose`) have no definition file by design, so their absence is never
+reported as a misconfiguration — what's checked for those is whether spawns pass
+a cheap `model` override.
+
+The most useful signal here is **divergence**: when the same agent is pinned to
+Opus in one repo and Sonnet in another, one team has already decided the cheaper
+model does that job well enough, which makes the recommendation evidence-based
+rather than speculative.
 
 The report also benchmarks cost per active day against Anthropic's published
 figures (~$13/developer/active day; 90% of users under $30/active day), so the

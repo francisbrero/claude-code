@@ -22,6 +22,10 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import agents  # noqa: E402
+import critic  # noqa: E402
+import evidence  # noqa: E402
+import grade as grade_mod  # noqa: E402
 import store  # noqa: E402
 from checks import _money, _tokens, build_findings  # noqa: E402
 from parse import find_transcripts, load_sessions, parse_session, repo_of  # noqa: E402
@@ -50,6 +54,35 @@ class Context:
         self.mcp_tool_count = settings.get("mcp_tool_count", 0)
         self.exclude_patterns = []
         self.excluded_files = 0
+
+        # Subagent definitions, read at BOTH user and project level, plus how
+        # agents were actually spawned. Declared config and real behaviour can
+        # disagree, and the report should reflect what actually ran.
+        self.agent_defs = agents.discover({s.cwd for s in sessions})
+        self.spawn_stats = agents.spawn_stats(sessions)
+
+        # Waste as a share of this setup's own spend (see grade.py).
+        self.grade = grade_mod.compute(self)
+
+    @property
+    def has_cheap_explore(self):
+        """Is there a retrieval agent pinned to a cheap model, and used?
+
+        Either a definition named like an explorer pinned to haiku/sonnet, or
+        Explore spawns that pass a cheap `model` override.
+        """
+        for a in self.agent_defs:
+            if a.is_cheap and any(
+                w in a.name.lower() for w in ("explore", "search", "retriev", "read")
+            ):
+                return True
+        for kind, info in self.spawn_stats.items():
+            if "explore" not in kind.lower():
+                continue
+            for model, n in info["overrides"].items():
+                if n and ("haiku" in model or "sonnet" in model):
+                    return True
+        return False
 
     def active_days(self):
         days = {s.start.date() for s in self.sessions if s.start}
@@ -116,9 +149,9 @@ def show_trend(root, uid):
 
     multi_user = len({r.get("user_id") for r in rows}) > 1
     print(f"\nStored reports ({len(rows)}):\n")
-    header = f"  {'Date':<12} {'User':<18} {'Spend':>10} {'/day':>9} {'Save':>10} {'Hit%':>6}"
+    header = f"  {'Date':<12} {'User':<18} {'Spend':>10} {'Waste':>10} {'Grade':>6}"
     if not multi_user:
-        header = f"  {'Date':<12} {'Spend':>10} {'/day':>9} {'Save':>10} {'Hit%':>6}"
+        header = f"  {'Date':<12} {'Spend':>10} {'Waste':>10} {'Grade':>6}"
     print(header)
     print("  " + "-" * (len(header) - 2))
 
@@ -126,12 +159,13 @@ def show_trend(root, uid):
         m = r.get("metrics") or {}
         per_day = m.get("cost_per_active_day_usd")
         hit = m.get("cache_hit_rate_pct")
+        waste = r.get("waste_usd")
+        pct = r.get("waste_pct")
         cells = [
             f"{r.get('date', '?'):<12}",
             f"{_money(r.get('total_cost_usd') or 0):>10}",
-            f"{_money(per_day):>9}" if per_day else f"{'—':>9}",
-            f"{_money(r.get('estimated_savings_usd') or 0):>10}",
-            f"{hit:>6.1f}" if hit else f"{'—':>6}",
+            (f"{_money(waste)} ({pct:.0f}%)".rjust(10) if waste else f"{'—':>10}"),
+            f"{(r.get('grade') or '—'):>6}",
         ]
         if multi_user:
             cells.insert(1, f"{r.get('user_id', '?'):<18}")
@@ -238,7 +272,7 @@ def spend_overview(ctx):
     return rows
 
 
-def render(ctx, findings, days):
+def render(ctx, findings, days, verdicts=None):
     sessions = ctx.sessions
     calls = ctx.calls
     starts = [s.start for s in sessions if s.start]
@@ -273,32 +307,35 @@ def render(ctx, findings, days):
     else:
         out.append("No material savings identified — this setup looks efficient.\n")
 
-    # Benchmark against Anthropic's published per-developer averages, so the
-    # headline number is interpretable rather than just large.
+    # The grade measures waste as a share of THIS setup's own spend. Spend per
+    # day is reported as context, never as a benchmark: a developer doing more
+    # valuable work spends more, and that is not a defect to correct.
     active = ctx.active_days()
     per_day = ctx.total_cost / active
-    BENCH_DAY = 13.0        # published average $/developer/active day
-    BENCH_HEAVY = 30.0      # published: 90% of users are under this per active day
-    if per_day > BENCH_HEAVY:
-        band = (
-            f"That is **{per_day / BENCH_DAY:.0f}x the published average** of ~${BENCH_DAY:.0f}"
-            f"/developer/active day, and above the ~${BENCH_HEAVY:.0f}/day mark that 90% of "
-            "users stay under. There is real headroom here."
+    g = ctx.grade
+    if g:
+        out.append(f"## Efficiency grade: {g['grade']}\n")
+        out.append(f"**{g['verdict']}**\n")
+        out.append(
+            f"Of the {_money(g['total_usd'])} spent, about **{_money(g['waste_usd'])} "
+            f"({g['waste_pct']:.0f}%)** bought nothing — it paid for context re-read "
+            "without adding information, work run on a pricier model than it needed, "
+            f"or calls that failed. The other {_money(g['efficient_usd'])} is the cost "
+            "of the work itself.\n"
         )
-    elif per_day > BENCH_DAY:
-        band = (
-            f"That is above the published ~${BENCH_DAY:.0f}/developer/active day average "
-            f"but within the normal range (90% of users are under ${BENCH_HEAVY:.0f}/day)."
+        rows = [("Wasted on", "Cost", "Share of spend")]
+        for comp in g["components"]:
+            rows.append((
+                comp["label"],
+                _money(comp["cost"]),
+                f"{100 * comp['cost'] / g['total_usd']:.1f}%",
+            ))
+        out.append(md_table(rows) + "\n")
+        out.append(
+            "_This grade is scored against your own spend, not against other "
+            "developers. Spending more because you are doing more is not waste; "
+            "these components are._\n"
         )
-    else:
-        band = (
-            f"That is at or below the published ~${BENCH_DAY:.0f}/developer/active day "
-            "average — this setup is already economical."
-        )
-    out.append(
-        f"Across **{active} active days**, that is **{_money(per_day)}/active day**. "
-        f"{band}\n"
-    )
 
     out.append(md_table([
         ("Metric", "Value"),
@@ -364,6 +401,30 @@ def render(ctx, findings, days):
             ))
         out.append(md_table(rows) + "\n")
 
+    # --- Critic verdicts ------------------------------------------------
+    by_key = {}
+    if verdicts:
+        for v in verdicts.get("verdicts", []):
+            by_key[v.get("finding_key")] = v
+
+        # Only surface what changes the reader's decision: which findings are
+        # the same lever (so their savings can't be added up). The per-finding
+        # verdicts are applied silently above, not narrated here.
+        shared = verdicts.get("shared_root_causes") or []
+        if shared:
+            out.append("## Don't double-count these\n")
+            out.append(
+                "Some findings describe one underlying problem at different "
+                "granularities. Fixing the root cause captures all of them — "
+                "adding their savings together overstates the total.\n"
+            )
+            title_of = {f.key: f.title for f in findings}
+            for group in shared:
+                keys = group.get("finding_keys", [])
+                names = ", ".join(f"**{title_of.get(k, k)}**" for k in keys)
+                out.append(f"- {names} — {group.get('why', '')}")
+            out.append("")
+
     # --- Findings -------------------------------------------------------
     out.append("## Findings\n")
     for i, f in enumerate(actionable, 1):
@@ -375,7 +436,15 @@ def render(ctx, findings, days):
             out.append(f.detail + "\n")
         if f.table:
             out.append(md_table(f.table) + "\n")
-        if f.fix:
+        # When the critic overturned a recommendation, show only the corrected
+        # one. Printing the original next to a "revised" version doubles the
+        # reading and makes the reader adjudicate a disagreement they have no
+        # way to settle.
+        v = by_key.get(f.key)
+        revised = (v or {}).get("revised_recommendation")
+        if revised and v.get("verdict") != "supported":
+            out.append(f"**Fix:** {revised}\n")
+        elif f.fix:
             out.append(f"**Fix:** {f.fix}\n")
 
     if healthy:
@@ -400,6 +469,9 @@ def to_json(ctx, findings, days):
     return {
         "generated": datetime.now().isoformat(timespec="seconds"),
         "user_id": store.user_id(),
+        "grade": (ctx.grade or {}).get("grade"),
+        "waste_usd": round((ctx.grade or {}).get("waste_usd", 0.0), 2),
+        "waste_pct": round((ctx.grade or {}).get("waste_pct", 0.0), 1),
         "window_days": days,
         "excluded_patterns": ctx.exclude_patterns,
         "excluded_files": ctx.excluded_files,
@@ -449,6 +521,13 @@ def main():
                     help=f"where to store dated reports (default: {store.DEFAULT_ROOT})")
     ap.add_argument("--no-store", action="store_true",
                     help="don't save a dated copy of this report")
+    ap.add_argument("--challenge", action="store_true",
+                    help="ask an LLM to challenge the recommendations against your "
+                         "actual config (sends config + counters, never transcripts)")
+    ap.add_argument("--challenge-model", default="sonnet", metavar="MODEL",
+                    help="model for the critic pass (default: sonnet)")
+    ap.add_argument("--show-packet", action="store_true",
+                    help="print exactly what --challenge would send, then exit")
     ap.add_argument("--trend", action="store_true",
                     help="show stored reports over time, then exit")
     ap.add_argument("--all-users", action="store_true",
@@ -494,11 +573,37 @@ def main():
           file=sys.stderr)
     findings = build_findings(ctx)
 
-    report = render(ctx, findings, args.days)
+    payload = to_json(ctx, findings, args.days)
+
+    verdicts = None
+    if args.challenge or args.show_packet:
+        packet = evidence.build(ctx, findings, store.sanitize(payload, ctx))
+
+        # Hard gate: never send anything that looks like conversation content,
+        # even if a future change to the packet builder lets one through.
+        leaks = evidence.find_leaks(packet)
+        if leaks:
+            print(f"error: refusing to send — packet contains {len(leaks)} value(s) "
+                  f"that look like file paths or commands: {leaks[:3]}",
+                  file=sys.stderr)
+            return 2
+
+        if args.show_packet:
+            print(json.dumps(packet, indent=2, sort_keys=True))
+            return 0
+
+        print(f"Challenging {len(findings)} recommendations "
+              f"({len(json.dumps(packet)) // 4:,} tokens)…", file=sys.stderr)
+        try:
+            verdicts = critic.review(packet, model=args.challenge_model)
+        except critic.CriticUnavailable as exc:
+            print(f"warning: {exc}", file=sys.stderr)
+            print("         the deterministic report below is unaffected.",
+                  file=sys.stderr)
+
+    report = render(ctx, findings, args.days, verdicts)
     with open(args.out, "w") as fh:
         fh.write(report)
-
-    payload = to_json(ctx, findings, args.days)
 
     stored = None
     if not args.no_store:

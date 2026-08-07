@@ -81,12 +81,36 @@ class ToolResult:
     is_error: bool
     target: str = ""
     repo: str = ""
+    is_sidechain: bool = False
+    error_text: str = ""   # first line of the error, for classification
 
     IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
 
     @property
     def is_image(self):
         return self.target.lower().endswith(self.IMAGE_EXT)
+
+    @property
+    def error_kind(self):
+        """Classify a failure by cause, since each has a different fix."""
+        if not self.is_error:
+            return ""
+        t = (self.error_text or "").lower()
+        if "has not been read yet" in t:
+            return "edit_before_read"
+        if "string to replace not found" in t or "not unique" in t:
+            return "stale_edit"
+        if "does not exist" in t or "no such file" in t or "eisdir" in t:
+            return "bad_path"
+        if "permission" in t or "denied" in t or "not allowed" in t:
+            return "permission_denied"
+        if "exit code 127" in t or "command not found" in t:
+            return "missing_command"
+        if "timed out" in t or "timeout" in t:
+            return "timeout"
+        if "exit code" in t:
+            return "shell_failure"
+        return "other"
 
     @property
     def kind(self):
@@ -130,6 +154,15 @@ def repo_of(cwd):
 
 
 @dataclass
+class AgentSpawn:
+    """One `Agent` tool call: which subagent, and any per-call model override."""
+
+    subagent_type: str
+    model: str
+    repo: str = ""
+
+
+@dataclass
 class Session:
     path: str
     session_id: str = None
@@ -138,6 +171,8 @@ class Session:
     version: str = None
     calls: list = field(default_factory=list)
     tool_results: list = field(default_factory=list)
+    agent_spawns: list = field(default_factory=list)
+    _spawn_index: dict = field(default_factory=dict)  # tool_use_id -> AgentSpawn
     user_turns: int = 0
     compactions: int = 0
     skills_used: set = field(default_factory=set)
@@ -193,6 +228,7 @@ def parse_session(path):
     """Read one transcript file into a Session. Malformed lines are skipped."""
     s = Session(path=path)
     pending_targets = {}  # tool_use_id -> (tool name, target)
+    spawn_ids = {}        # tool_use_id -> AgentSpawn (deduped within the file)
     try:
         fh = open(path, errors="replace")
     except OSError:
@@ -254,6 +290,18 @@ def parse_session(path):
                         )
                         if p.get("id"):
                             pending_targets[p["id"]] = (p.get("name"), str(target))
+                        # Record how subagents are actually being spawned, so
+                        # declared config can be checked against real behaviour.
+                        if p.get("name") == "Agent":
+                            spawn = AgentSpawn(
+                                subagent_type=inp.get("subagent_type") or "",
+                                model=(inp.get("model") or "").strip().lower(),
+                                repo=repo_of(d.get("cwd") or s.cwd),
+                            )
+                            # Key on the tool_use id: two identical spawns are a
+                            # real pair, but the same id replayed across forked
+                            # transcript files is one event.
+                            spawn_ids[p.get("id") or id(spawn)] = spawn
                 model = msg.get("model") or "unknown"
                 if model == "<synthetic>":
                     continue  # not a billed call
@@ -296,12 +344,23 @@ def parse_session(path):
                                 name=tool_name or _tool_name_for(d),
                                 chars=len(_result_text(part)),
                                 is_error=bool(part.get("is_error")),
+                                # A subagent's own tool results never enter the
+                                # parent's context — counting them would credit
+                                # delegation with bloat it actually prevented.
+                                is_sidechain=bool(d.get("isSidechain")),
                                 target=target,
                                 repo=repo_of(d.get("cwd") or s.cwd),
+                                error_text=(
+                                    _result_text(part)[:200]
+                                    if part.get("is_error") else ""
+                                ),
                             ))
                         elif part.get("type") == "text":
                             s.user_turns += 1
 
+    # Keep ids and spawns as parallel ordered lists so merging can dedupe by id.
+    s._spawn_index = dict(spawn_ids)
+    s.agent_spawns = list(spawn_ids.values())
     return s if s.calls else None
 
 
@@ -430,6 +489,11 @@ def load_sessions(root=None, since_days=None, limit=None, exclude=None):
             # branch-specific results that exist in no other file. Dedupe on the
             # result's own identity instead, keeping the union.
             base.tool_results.extend(s.tool_results)
+            # Spawns are replayed across forked files; keep one per tool_use id.
+            for sid, sp in s._spawn_index.items():
+                if sid not in base._spawn_index:
+                    base._spawn_index[sid] = sp
+                    base.agent_spawns.append(sp)
             base.user_turns = max(base.user_turns, s.user_turns)
             base.compactions = max(base.compactions, s.compactions)
             base.skills_used |= s.skills_used
@@ -442,7 +506,7 @@ def load_sessions(root=None, since_days=None, limit=None, exclude=None):
         seen = set()
         unique = []
         for r in s.tool_results:
-            sig = (r.name, r.chars, r.is_error, r.target)
+            sig = (r.name, r.chars, r.is_error, r.target, r.error_text, r.is_sidechain)
             if sig in seen:
                 continue
             seen.add(sig)

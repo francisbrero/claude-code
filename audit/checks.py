@@ -8,13 +8,35 @@ number nobody will act on.
 
 import os
 import statistics
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
+import agents
+import parse
 from pricing import (CACHE_READ_MULT, CACHE_WRITE_1H_MULT, CACHE_WRITE_5M_MULT,
                      FAMILY_TIER, prices_for)
 
 CHECKS = []
+
+# Human-readable labels for the failure buckets in `failed_tool_calls`.
+ERROR_LABEL = {
+    "edit_before_read": "Edit before read",
+    "stale_edit": "Stale edit (target text changed)",
+    "bad_path": "File or path not found",
+    "permission_denied": "Permission denied",
+    "missing_command": "Command not found",
+    "timeout": "Timed out",
+    "shell_failure": "Shell command failed",
+    "other": "Other",
+}
+
+# Agent types the harness provides. They have no file in .claude/agents/ by
+# design, so a missing definition is not a finding for these.
+BUILTIN_AGENTS = {
+    "Explore", "Plan", "general-purpose", "claude", "fork",
+    "statusline-setup", "claude-code-guide", "(default)",
+}
 
 
 def check(fn):
@@ -376,32 +398,49 @@ def expensive_model_grunt_work(ctx):
               f"{statistics.median([c.output for c in grunt]):.0f}")]
             + [("— in `%s`" % r, _money(v)) for r, v in top_repos]
         ),
-        fix=(
-            "Move the read-heavy phase onto a cheap model. Concretely:\n\n"
-            "**1. Create `~/.claude/agents/explore.md`** (this file does not exist yet if "
-            "the config check below flags it):\n\n"
+        fix=_tiering_fix(ctx, repo_hint),
+    )
+
+
+def _tiering_fix(ctx, repo_hint):
+    """Remediation text, matched to what is already configured.
+
+    Telling a team that already pins its retrieval agent to Haiku to "create an
+    explore agent" is wrong and gets the whole report dismissed. Only recommend
+    creating one when there genuinely isn't a cheap retrieval agent.
+    """
+    if ctx.has_cheap_explore:
+        head = (
+            "A cheap retrieval agent already exists and is being used, so the gap "
+            "is not the agent definition — it is how much reading still happens on "
+            "the main thread. Route more of the find/read/gather work through it, "
+            "and check whether the *reviewer* subagents are pinned to a premium "
+            "model (see the subagent-pinning finding).\n\n"
+        )
+    else:
+        head = (
+            "Move the read-heavy phase onto a cheap model.\n\n"
+            "**1. Create `~/.claude/agents/explore.md`**:\n\n"
             "```markdown\n"
             "---\n"
             "name: explore\n"
-            "description: Read-heavy search and context gathering. Use for locating code, "
-            "reading files, and summarising findings.\n"
+            "description: Read-heavy search and context gathering. Use for locating "
+            "code, reading files, and summarising findings.\n"
             "model: haiku\n"
             "tools: Read, Grep, Glob, Bash\n"
             "---\n\n"
-            "Gather the requested context and return a concise summary with `file:line` "
-            "citations. Return findings, not file contents.\n"
+            "Gather the requested context and return a concise summary with "
+            "`file:line` citations. Return findings, not file contents.\n"
             "Do not read or enumerate `node_modules/`, `.next`, `dist`, `build`, "
             "generated files, or `*.lock`.\n"
             "```\n\n"
-            "**2. Route retrieval to it** — in a skill or prompt, delegate the "
-            "\"find/read/gather\" step to `explore` and keep only the decision on the "
-            "premium model.\n\n"
-            "**3. Set the default subagent model** so anything not explicitly pinned still "
-            "lands cheap: `CLAUDE_CODE_SUBAGENT_MODEL=haiku` in `~/.claude/settings.json` "
-            "under `env`.\n\n"
-            + (f"**Where it matters most:** {repo_hint}" if repo_hint else "")
-        ),
-    )
+            "**2. Route retrieval to it** — delegate the \"find/read/gather\" step "
+            "and keep only the decision on the premium model.\n\n"
+            "**3. Set the default subagent model** so anything not explicitly "
+            "pinned still lands cheap: `CLAUDE_CODE_SUBAGENT_MODEL=haiku` in "
+            "`~/.claude/settings.json` under `env`.\n\n"
+        )
+    return head + (f"**Where it matters most:** {repo_hint}" if repo_hint else "")
 
 
 @check
@@ -662,11 +701,11 @@ def session_hygiene(ctx):
                 f"These are long *tasks*, not sprawling sessions — {task_shaped:.0f}% of "
                 f"them run under a skill ({', '.join(k for k, _ in skill_counts.most_common(3))}), "
                 "so `/clear` mid-task is not available. What actually helps:\n\n"
-                "1. **Keep the bulk out of the transcript.** The context grows because "
-                "file reads and command output accumulate in the main thread. Route "
-                "exploration through subagents — their output never enters the parent "
-                "context, only their summary does. This is the single biggest lever on a "
-                "long task.\n"
+                "1. **Cap what enters the transcript.** The context grows because file "
+                "reads and command output accumulate in the main thread. See the "
+                "\"What your context is made of\" finding for this setup's actual "
+                "split — it says which sources to cap, and whether delegating more "
+                "would help or is already saturated.\n"
                 "2. **Compact deliberately, not automatically.** Auto-compact fires late "
                 "and summarises everything at once. A skill-level checkpoint that writes "
                 "state to a dev-doc and compacts at a task boundary keeps the summary "
@@ -813,6 +852,152 @@ def tool_output_waste(ctx):
 
 
 @check
+def context_composition(ctx):
+    """What the main-thread context is actually MADE of.
+
+    Everyone's advice for long sessions is "delegate to subagents". That only
+    helps if subagent results are where the context is going. Measuring the
+    composition first tells you whether the standard advice applies to this
+    setup or targets a rounding error.
+
+    Main thread only: a subagent's own reads never enter the parent context,
+    so counting them would credit delegation with bloat it actually prevented.
+    """
+    results = [
+        r for s in ctx.sessions for r in s.tool_results
+        if not r.is_error and not r.is_sidechain
+    ]
+    if len(results) < 100:
+        return None
+
+    by_tool = defaultdict(lambda: {"chars": 0, "calls": 0, "sizes": []})
+    for r in results:
+        name = r.name or "other"
+        entry = by_tool[name]
+        entry["chars"] += r.chars
+        entry["calls"] += 1
+        entry["sizes"].append(r.chars)
+
+    total = sum(e["chars"] for e in by_tool.values())
+    if not total:
+        return None
+
+    ranked = sorted(by_tool.items(), key=lambda kv: -kv[1]["chars"])
+
+    rows = [("Source", "Share", "Chars", "Calls", "Median", "Largest")]
+    for name, e in ranked[:8]:
+        sizes = sorted(e["sizes"])
+        rows.append((
+            f"`{name}`",
+            f"{_pct(e['chars'], total):.1f}%",
+            f"{e['chars'] / 1e6:.1f}M",
+            f"{e['calls']:,}",
+            f"{sizes[len(sizes) // 2]:,}",
+            f"{sizes[-1]:,}",
+        ))
+
+    # Growth rate: how fast does a long session approach the ceiling?
+    rates = []
+    for s in ctx.sessions:
+        mains = sorted((c for c in s.main_calls if c.ts), key=lambda c: c.ts)
+        if len(mains) < 20:
+            continue
+        rates.append((mains[-1].total_input - mains[0].total_input) / len(mains))
+    growth = statistics.median(rates) if rates else 0
+    turns_to_ceiling = int((200_000 - 30_000) / growth) if growth > 0 else 0
+
+    # Is delegation already saturated? Agent results are the only part of the
+    # main-thread context that delegating MORE can remove.
+    agent_share = _pct(by_tool.get("Agent", {}).get("chars", 0), total)
+
+    # Per-source remediation, keyed to the shape of each source's distribution.
+    # A concentrated source (few huge results) and a diffuse one (thousands of
+    # small ones) need different fixes, so classify before advising.
+    steps = []
+    for name, e in ranked[:4]:
+        share = _pct(e["chars"], total)
+        if share < 8:
+            continue
+        sizes = sorted(e["sizes"])
+        median = sizes[len(sizes) // 2]
+        top1 = sum(sizes[-max(1, len(sizes) // 100):])
+        concentrated = _pct(top1, e["chars"]) > 40
+
+        if name == "Bash":
+            steps.append(
+                f"**`Bash` — {share:.0f}%** ({e['calls']:,} calls, median "
+                f"{median:,} chars). "
+                + ("A few huge outputs dominate; cap those specific commands."
+                   if concentrated else
+                   "No dominant offender — this is thousands of ordinary "
+                   "results accumulating. Capping output has to become a habit "
+                   "in your skills (`| head -100`, `--quiet`, `wc -l`, or "
+                   "redirect to a file and read back a slice), not a one-time "
+                   "cleanup of outliers.")
+            )
+        elif name == "Read":
+            steps.append(
+                f"**`Read` — {share:.0f}%** ({e['calls']:,} calls, median "
+                f"{median:,} chars, largest {sizes[-1]:,}). Use `offset`/`limit`, "
+                "or grep for the symbol first and read only around the hit."
+                + ("  The top 1% of reads are most of this — those files are "
+                   "the place to start." if concentrated else "")
+            )
+        elif name == "Agent":
+            steps.append(
+                f"**`Agent` — {share:.0f}%** ({e['calls']:,} spawns, median "
+                f"{median:,} chars returned). Subagent summaries are already "
+                "compact; this is not where the context is going."
+            )
+        else:
+            steps.append(
+                f"**`{name}` — {share:.0f}%** ({e['calls']:,} calls, median "
+                f"{median:,} chars). Worth a look if this is unexpected."
+            )
+
+    detail = [
+        "Long sessions are usually treated as a discipline problem. They are "
+        "really an accumulation problem, and accumulation has a specific "
+        "composition worth measuring before acting on generic advice.\n",
+        f"Main-thread tool results total **{total / 1e6:.0f}M characters** "
+        f"(~{total / 4 / 1e6:.1f}M tokens) across {len(results):,} calls. "
+        "Subagent-internal results are excluded: they never enter the parent "
+        "context, which is the point of delegating.\n",
+    ]
+    if growth:
+        detail.append(
+            f"Median context growth: **{growth:,.0f} tokens per turn** — from a "
+            f"typical baseline that reaches the 200K window at roughly "
+            f"**turn {turns_to_ceiling}**.\n"
+        )
+
+    if agent_share < 15:
+        detail.append(
+            f"**Delegating more will not fix this.** Subagent returns are only "
+            f"**{agent_share:.1f}%** of main-thread context, so even perfect "
+            "delegation leaves the rest untouched. The standard 'use subagents' "
+            "advice is already saturated here — the top sources below are what "
+            "actually need capping.\n"
+        )
+
+    top_two = _pct(sum(e["chars"] for _, e in ranked[:2]), total)
+    return Finding(
+        key="context_composition",
+        title="What your context is made of",
+        severity="medium",
+        savings=0.0,  # diagnostic: the cost is already counted by other checks
+        summary=(
+            f"`{ranked[0][0]}` and `{ranked[1][0]}` are {top_two:.0f}% of "
+            f"everything accumulating in the main thread"
+            + (f"; context grows {growth:,.0f} tokens/turn." if growth else ".")
+        ),
+        detail="\n".join(detail),
+        table=rows,
+        fix=" ".join(f"({i}) {s}" for i, s in enumerate(steps, 1)),
+    )
+
+
+@check
 def runaway_context(ctx):
     """Sessions that blow past the standard 200K window into long-context territory.
 
@@ -886,9 +1071,11 @@ def runaway_context(ctx):
                 f"{skill_share:.0f}% of these are skill-driven single tasks "
                 f"({', '.join(k for k, _ in runaway_skills.most_common(3))}), so "
                 "'start a new session' is not the fix. Attack the growth rate instead:\n\n"
-                "1. **Delegate reading.** In these sessions the main thread does the "
-                "file reading itself. Every byte read stays in context for all remaining "
-                "turns. A subagent returns a summary and drops the raw bytes.\n"
+                "1. **Cap the biggest sources.** Every byte a tool returns stays in "
+                "context for all remaining turns. The \"What your context is made of\" "
+                "finding measures which tools those actually are here — delegation only "
+                "helps if subagent returns are a large share, which is often not the "
+                "case.\n"
                 "2. **Checkpoint to a dev-doc and compact at task boundaries** (after "
                 "planning, after implementation, before review) rather than letting "
                 "auto-compact fire at an arbitrary point.\n"
@@ -907,6 +1094,372 @@ def runaway_context(ctx):
 
 
 @check
+def failed_tool_calls(ctx):
+    """Failed tool calls cost a full turn and teach the model nothing.
+
+    Every failure bills the whole context to produce an error, then bills it
+    again for the retry. Unlike most waste this one is fixable at the source:
+    the common failures have specific, addressable causes.
+    """
+    results = [r for s in ctx.sessions for r in s.tool_results]
+    if not results:
+        return None
+
+    errors = [r for r in results if r.is_error]
+    if len(errors) < 10:
+        return None
+
+    rate = _pct(len(errors), len(results))
+
+    # A failed call costs roughly one main-thread turn: the context is sent,
+    # an error comes back, and the work still has to be redone.
+    main = [c for s in ctx.sessions for c in s.main_calls]
+    avg_turn = statistics.mean([c.cost for c in main]) if main else 0
+    savings = len(errors) * avg_turn * 0.6  # some failures are unavoidable probing
+
+    buckets = Counter(r.error_kind for r in errors)
+
+    rows = [("Failure", "Count", "Share")]
+    for kind, n in buckets.most_common(8):
+        rows.append((ERROR_LABEL.get(kind, kind), f"{n:,}", f"{_pct(n, len(errors)):.0f}%"))
+
+    # Sessions where failures are concentrated are the ones worth looking at.
+    worst = []
+    for s in ctx.sessions:
+        if len(s.tool_results) < 40:
+            continue
+        errs = sum(1 for r in s.tool_results if r.is_error)
+        if errs:
+            worst.append((_pct(errs, len(s.tool_results)), errs, s))
+    worst.sort(key=lambda t: -t[0])
+
+    steps = []
+    if buckets.get("edit_before_read"):
+        steps.append(
+            f"**Edit-before-read ({buckets['edit_before_read']}).** The model tried to "
+            "edit a file it hadn't opened. Usually means a skill or prompt tells it to "
+            "edit a path directly — have that step read first, or pass the content."
+        )
+    if buckets.get("stale_edit"):
+        steps.append(
+            f"**Stale edit ({buckets['stale_edit']}).** The target string had already "
+            "changed. Common after a formatter or a parallel edit; re-read before "
+            "editing rather than reusing a remembered snippet."
+        )
+    if buckets.get("bad_path"):
+        steps.append(
+            f"**Bad path ({buckets['bad_path']}).** Files referenced that don't exist — "
+            "usually a wrong working directory in a worktree, or a path from CLAUDE.md "
+            "that has moved. Check the paths your instructions name still resolve."
+        )
+    if buckets.get("shell_failure"):
+        steps.append(
+            f"**Shell failures ({buckets['shell_failure']}).** Commands exiting non-zero. "
+            "Worth checking whether a recurring one (a test runner, a lint step) is "
+            "failing predictably and could be fixed or removed from the loop."
+        )
+    if buckets.get("timeout"):
+        steps.append(
+            f"**Timeouts ({buckets['timeout']}).** These bill the full context and return "
+            "nothing. Raise the timeout for known-slow commands or run them in the "
+            "background."
+        )
+    if buckets.get("permission_denied"):
+        steps.append(
+            f"**Permission denials ({buckets['permission_denied']}).** Each denial costs a "
+            "turn. Add the safe, frequent commands to the allow-list in "
+            "`.claude/settings.json`."
+        )
+
+    sev = "high" if rate > 5 else ("medium" if rate > 2 else "low")
+    return Finding(
+        key="failed_tools",
+        title="Failed tool calls and retry loops",
+        severity=sev,
+        savings=savings,
+        summary=(
+            f"{len(errors):,} of {len(results):,} tool calls failed ({rate:.1f}%), "
+            f"costing roughly {_money(savings)} in turns that produced nothing."
+        ),
+        detail=(
+            "A failed tool call is billed like any other turn: the whole context goes "
+            "up, an error comes back, and the work still has to be done. The retry "
+            "then pays for the same context again.\n\n"
+            f"At an average of {_money(avg_turn)} per main-thread turn, "
+            f"{len(errors):,} failures is about {_money(len(errors) * avg_turn)} of "
+            "spend before accounting for the retries. The estimate above discounts "
+            "that, since some failures are legitimate probing.\n\n"
+            "Unlike most waste in this report, these have specific causes you can fix "
+            "at the source rather than habits to change."
+        ),
+        table=rows,
+        fix=" ".join(f"({i}) {s}" for i, s in enumerate(steps, 1)) or (
+            "Review the most common failures above and address their causes."
+        ),
+    )
+
+
+@check
+def subagent_model_pinning(ctx):
+    """Which subagents run on a premium model, and what that costs.
+
+    Reads agent definitions at BOTH the user and project level. A check that
+    only looks at ~/.claude/agents/ will tell a team with a well-configured repo
+    to "create an agents directory", which is wrong and gets the report ignored.
+    """
+    defs = ctx.agent_defs
+    stats = ctx.spawn_stats
+    if not defs and not stats:
+        return None
+
+    # Cost of sidechain work, split by model tier.
+    side = [c for c in ctx.calls if c.is_sidechain]
+    premium_calls = [c for c in side if FAMILY_TIER.get(c.family, 3) > 2]
+    premium_cost = sum(c.cost for c in premium_calls)
+    if not side:
+        return None
+
+    # A premium call that emits almost nothing is a wrapper turn — orchestration
+    # around an external tool, not generation. Downgrading the model does not
+    # remove that cost, because the cost is the re-read context, not the output.
+    WRAPPER_OUT = 5
+    wrapper = [c for c in premium_calls if c.output <= WRAPPER_OUT]
+    substantive = [c for c in premium_calls if c.output > WRAPPER_OUT]
+    wrapper_cost = sum(c.cost for c in wrapper)
+    substantive_cost = sum(c.cost for c in substantive)
+
+    grouped = agents.by_name(defs)
+
+    # Premium-pinned agents that are spawned often enough to matter. Agents that
+    # delegate to an external CLI are tracked separately: their pin sets the
+    # fallback tier, so "use a cheaper model" is the wrong recommendation.
+    premium = []
+    external = []
+    for name, group in grouped.items():
+        models = {a.model for a in group if a.model}
+        if not any("opus" in m for m in models):
+            continue
+        spawns = stats.get(name, {}).get("spawns", 0)
+        row = (name, sorted(models), spawns, group)
+        if any(a.delegates_externally for a in group):
+            external.append(row)
+        else:
+            premium.append(row)
+    premium.sort(key=lambda t: -t[2])
+    external.sort(key=lambda t: -t[2])
+
+    # The same agent pinned differently across repos: one repo has already
+    # decided the cheaper model is adequate for this exact job.
+    diverging = []
+    for name, group in grouped.items():
+        # An external-delegating agent's model is its fallback tier. Two repos
+        # choosing different fallbacks is not evidence that the cheaper one is
+        # adequate for the primary path.
+        if any(a.delegates_externally for a in group):
+            continue
+        models = {a.model or "inherit" for a in group}
+        if len(models) > 1:
+            cheap = sorted(m for m in models if "haiku" in m or "sonnet" in m)
+            pricey = sorted(m for m in models if "opus" in m)
+            if cheap and pricey:
+                repos = {}
+                for a in group:
+                    # a.path is <repo>/.claude/agents/<name>.md — climb past
+                    # `.claude/agents` before deriving the repo name.
+                    root = os.path.dirname(os.path.dirname(os.path.dirname(a.path)))
+                    repos.setdefault(a.model or "inherit", set()).add(
+                        parse.repo_of(root))
+                diverging.append((name, cheap, pricey, repos))
+
+    # Spawned types with no definition anywhere -> they inherit the main model.
+    # Built-ins ship with the harness and have no user-authored file, so their
+    # absence from .claude/agents/ is normal, not a misconfiguration. What
+    # matters for those is whether spawns pass a cheap `model` override.
+    defined_names = set(grouped)
+    inheriting = []
+    for t, info in stats.items():
+        if t in defined_names or t in BUILTIN_AGENTS or info["spawns"] < 5:
+            continue
+        if "(no override)" not in info["overrides"]:
+            continue
+        inheriting.append((t, info["spawns"]))
+    inheriting.sort(key=lambda t: -t[1])
+
+    # Built-ins spawned on the main model with no override.
+    unpinned_builtins = []
+    for t, info in stats.items():
+        if t not in BUILTIN_AGENTS or t == "fork":
+            continue
+        bare = info["overrides"].get("(no override)", 0)
+        if bare >= 5:
+            unpinned_builtins.append((t, bare, info["spawns"]))
+    unpinned_builtins.sort(key=lambda t: -t[1])
+
+    if not premium and not diverging and not inheriting and not unpinned_builtins:
+        return None
+
+    # Savings come only from SUBSTANTIVE premium generation re-priced one tier
+    # down. Wrapper turns are excluded: their cost is re-read context, which a
+    # cheaper model would still pay. Discounted further because reviewing is
+    # judgement work where a downgrade carries real quality risk.
+    savings = substantive_cost * 0.8 * 0.5
+
+    rows = [("Subagent", "Pinned model", "Spawns", "Note")]
+    for name, models, spawns, group in external[:6]:
+        rows.append((
+            f"`{name}`",
+            "/".join(models),
+            f"{spawns:,}" if spawns else "—",
+            "external-primary (pin = fallback)",
+        ))
+    for name, models, spawns, group in premium[:8]:
+        rows.append((
+            f"`{name}`",
+            "/".join(models),
+            f"{spawns:,}" if spawns else "—",
+            group[0].scope,
+        ))
+    for name, spawns in inheriting[:5]:
+        rows.append((f"`{name}`", "_inherits main model_", f"{spawns:,}", "undefined"))
+    for name, bare, total in unpinned_builtins[:5]:
+        rows.append((
+            f"`{name}`",
+            f"_no override on {bare} of {total}_",
+            f"{total:,}",
+            "built-in",
+        ))
+
+    detail = [
+        f"Subagent calls cost **{_money(sum(c.cost for c in side))}**, of which "
+        f"**{_money(premium_cost)}** ran on a premium model.\n",
+        f"Agent definitions found: **{len(defs)}** "
+        f"({sum(1 for a in defs if a.scope == 'project')} project-level, "
+        f"{sum(1 for a in defs if a.scope == 'user')} user-level).\n",
+        "**Most premium subagent spend is not generation.** Splitting those calls "
+        f"by what they actually emitted:\n\n"
+        f"- **{len(wrapper):,} wrapper turns** (≤{WRAPPER_OUT} output tokens) — "
+        f"{_money(wrapper_cost)}. These are orchestration steps: deciding what to "
+        "run, shelling out, reading a result. The cost is the context re-read on "
+        "each turn, **not** the model's output — so moving them to a cheaper model "
+        "saves proportionally less than the headline suggests, and fewer/larger "
+        "turns saves more than a downgrade would.\n"
+        f"- **{len(substantive):,} substantive turns** (>{WRAPPER_OUT} output "
+        f"tokens) — {_money(substantive_cost)}. This is the only part where the "
+        "model tier is really the lever, and it is what the saving below is "
+        "based on.\n",
+    ]
+
+    if external:
+        detail.append(
+            "**Externally-delegating agents are excluded from the recommendation.** "
+            + ", ".join(f"`{n}`" for n, _, _, _ in external[:4])
+            + " shell out to an external CLI on the primary path and only use the "
+            "pinned model as a fallback. Their `model:` line sets the *fallback* "
+            "tier, so changing it does not change what normally runs — and would "
+            "quietly downgrade the safety net.\n"
+        )
+
+    if diverging:
+        detail.append(
+            "**The same agent is pinned differently across repos.** One repo has "
+            "already decided a cheaper model does this exact job well enough:\n"
+        )
+        for name, cheap, pricey, repos in diverging[:4]:
+            cheap_repos = ", ".join(sorted(r for m in cheap for r in repos.get(m, [])))
+            pricey_repos = ", ".join(sorted(r for m in pricey for r in repos.get(m, [])))
+            detail.append(
+                f"- `{name}`: **{'/'.join(pricey)}** in {pricey_repos} — but "
+                f"**{'/'.join(cheap)}** in {cheap_repos}."
+            )
+        detail.append("")
+
+    if inheriting:
+        detail.append(
+            "**Spawned but never defined**, so these inherit the main "
+            "conversation's model: "
+            + ", ".join(f"`{n}` ({c} spawns)" for n, c in inheriting[:5]) + "\n"
+        )
+
+    if unpinned_builtins:
+        detail.append(
+            "**Built-in agents spawned without a `model` override**, so they run on "
+            "the main model: "
+            + ", ".join(f"`{n}` ({b} of {t} spawns)"
+                        for n, b, t in unpinned_builtins[:5])
+            + ". These need no definition file — pass `model` at spawn time, or set "
+              "a cheap default.\n"
+        )
+
+    # A reviewer that reads a large diff and emits a short verdict is mostly
+    # retrieval; the ratio makes that measurable rather than assumed.
+    # The overall input:output ratio is dominated by wrapper turns, so quoting it
+    # as evidence of "retrieval on an expensive model" would overstate the case.
+    # Report the ratio for substantive turns only.
+    if substantive:
+        s_in = sum(c.total_input for c in substantive)
+        s_out = sum(c.output for c in substantive)
+        if s_out:
+            detail.append(
+                f"Across the substantive turns alone the ratio is "
+                f"**{s_in / s_out:.0f}:1** ({_tokens(s_in)} read vs "
+                f"{_tokens(s_out)} written). A high ratio here means the model is "
+                "still ingesting a lot to produce a little — worth splitting into a "
+                "cheap gather stage and a premium verdict stage.\n"
+            )
+
+    fixes = []
+    if wrapper_cost > substantive_cost:
+        fixes.append(
+            f"Most of this ({_money(wrapper_cost)}) is wrapper turns, so the lever is "
+            "**turn count, not model tier**: each orchestration step re-reads the "
+            "whole subagent context to emit a few tokens. Batch the shell steps "
+            "(probe, write prompt, invoke, read result) into fewer calls and the "
+            "cost falls without touching the model."
+        )
+    if diverging:
+        fixes.append(
+            "Align the divergent agents on the cheaper model that another repo is "
+            "already using in production, then compare review quality on the next "
+            "few PRs before deciding it was wrong."
+        )
+    if premium and substantive_cost > 20:
+        fixes.append(
+            "For the agents that genuinely generate on a premium model, split the "
+            "work rather than downgrading the verdict: a cheap first stage gathers "
+            "context, and the premium model judges only that summary."
+        )
+    if inheriting:
+        fixes.append(
+            "Define the undefined agents (or pass `model:` at spawn) so they stop "
+            "inheriting the main model by default."
+        )
+    if unpinned_builtins:
+        fixes.append(
+            "Set `CLAUDE_CODE_SUBAGENT_MODEL=haiku` under `env` in "
+            "`~/.claude/settings.json` so built-in agents spawned without an "
+            "explicit override stop defaulting to the main model."
+        )
+
+    return Finding(
+        key="subagent_pinning",
+        title="Subagent model pinning",
+        severity="medium" if savings > 5 else "low",
+        savings=savings,
+        summary=(
+            f"{_money(premium_cost)} of subagent work runs on a premium model, but "
+            f"only {_money(substantive_cost)} of it is actual generation — "
+            f"{_money(wrapper_cost)} is wrapper turns whose cost is re-read context"
+            + (f"; {len(diverging)} agent(s) are pinned cheaper in another repo"
+               if diverging else "")
+            + "."
+        ),
+        detail="\n".join(detail),
+        table=rows,
+        fix=" ".join(fixes),
+    )
+
+
+@check
 def config_levers(ctx):
     """Settings-level switches that change cost but leave no trace in usage numbers."""
     issues = []
@@ -916,13 +1469,15 @@ def config_levers(ctx):
     for name in ("settings.json", "settings.local.json"):
         merged_env.update((settings.get(name) or {}).get("env") or {})
 
-    # 1. No custom subagent definitions => subagents inherit the main model.
-    #    Retrieval work then runs at premium prices by default.
-    if not settings.get("has_agents_dir"):
+    # 1. No subagent definitions anywhere — user level OR any project. Only
+    #    report this when both are genuinely absent: a repo with its own
+    #    .claude/agents/ is already configured, and telling that team to create
+    #    a user-level directory is wrong.
+    if not ctx.agent_defs:
         issues.append(
-            "**No `~/.claude/agents/` directory.** Subagents inherit the main model "
-            "instead of being pinned to a cheap one, so delegated retrieval costs the "
-            "same as doing it inline."
+            "**No subagent definitions found** at `~/.claude/agents/` or in any "
+            "repo's `.claude/agents/`. Subagents inherit the main model, so "
+            "delegated retrieval costs the same as doing it inline."
         )
         fixes.append(
             "Create `~/.claude/agents/explore.md` with `model: haiku` in the frontmatter "
@@ -995,9 +1550,18 @@ def build_findings(ctx):
         try:
             f = fn(ctx)
         except Exception as exc:  # a broken check must not kill the report
+            # Surface it loudly. A crashed check previously rendered as a
+            # low-severity row at the bottom of the roadmap, which reads like a
+            # finding worth ignoring rather than a bug — one shipped that way.
+            print(f"warning: check `{fn.__name__}` crashed: {exc}", file=sys.stderr)
             f = Finding(
-                key=fn.__name__, title=fn.__name__, severity="low", savings=0.0,
-                summary=f"check failed: {exc}",
+                key=fn.__name__,
+                title=f"⚠️ Check `{fn.__name__}` failed to run",
+                severity="high", savings=0.0,
+                summary=(
+                    f"This check crashed (`{exc}`), so its findings are missing "
+                    "from this report. The other findings are unaffected."
+                ),
             )
         if f:
             out.append(f)
